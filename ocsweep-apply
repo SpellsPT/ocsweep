@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# ocsweep-apply — apply the chosen overclocks and keep them applied. Installed root-owned in /usr/local/libexec/ocsweep/
+# by `ocsweep --apply`, run as ROOT by:
+#   ocsweep-apply-boot.service   once per boot (--boot), and --clean-shutdown when the machine shuts down cleanly
+#   ocsweep-apply.timer          every 15 min (no argument): puts back anything that got reset
+# Crash guard: --boot leaves a marker that only a clean shutdown removes. If the machine died instead (a hang, a
+# watchdog reset — possibly caused by the overclock itself), the next boot finds the marker, applies NOTHING and
+# writes /var/lib/ocsweep/held. Nothing is applied again until someone runs `ocsweep --apply` (which lifts the hold).
+# Reads /etc/ocsweep/apply.json, keyed by GPU UUID (survives cards moving between slots):
+#   {"GPU-...": {"name": "<card name>", "mem": 1000, "core": 50}}
+# mem = NVML memory offset (transfer-rate MHz, Afterburner shows half), core = core offset MHz.
+# Cards not in the file are left alone. A card that ocsweep is testing right now (/run/ocsweep/sweeping-<UUID>) is
+# skipped. Only writes when a value differs. Exit 1 if any card could not be set — shows up in systemctl --failed.
+set -u
+MAP=/etc/ocsweep/apply.json; V=/var/lib/ocsweep; PENDING=$V/boot-marker; HELD=$V/held
+mkdir -p "$V"
+case "${1:-}" in
+  --clean-shutdown) rm -f "$PENDING"; exit 0 ;;
+  --boot)
+    if [ -e "$PENDING" ]; then
+      echo "previous boot ended WITHOUT a clean shutdown after overclocks were applied ($(cat "$PENDING")) — not applying; holding until 'ocsweep --apply'" | tee "$HELD"
+      rm -f "$PENDING"; exit 0
+    fi ;;
+esac
+[ -e "$HELD" ] && { echo "HELD: $(cat "$HELD")"; exit 0; }
+[ -s "$MAP" ] || { echo "nothing to apply ($MAP missing or empty)"; exit 0; }
+[ "${1:-}" = --boot ] && { echo "applied at boot $(cat /proc/sys/kernel/random/boot_id) $(date '+%F %T')" > "$PENDING"; sync; }
+for i in $(seq 1 30); do nvidia-smi -L >/dev/null 2>&1 && break; sleep 2; done
+nvidia-smi -pm 1 >/dev/null 2>&1 || echo "warning: persistence mode could not be enabled"
+python3 - "$MAP" <<'PY'
+import json, os, sys, pynvml as n
+want = json.load(open(sys.argv[1])); n.nvmlInit(); bad = 0; seen = set()
+for i in range(n.nvmlDeviceGetCount()):
+    h = n.nvmlDeviceGetHandleByIndex(i); u = n.nvmlDeviceGetUUID(h); u = u.decode() if isinstance(u, bytes) else u
+    if u not in want: continue
+    seen.add(u); w = want[u]; name = w.get("name", u)
+    if os.path.exists(f"/run/ocsweep/sweeping-{u}"): print(f"gpu{i} {name}: being swept right now — skipped"); continue
+    for key, get, put in (("mem", n.nvmlDeviceGetMemClkVfOffset, n.nvmlDeviceSetMemClkVfOffset),
+                          ("core", n.nvmlDeviceGetGpcClkVfOffset, n.nvmlDeviceSetGpcClkVfOffset)):
+        if key not in w: continue
+        try:
+            before = get(h)
+            if before != int(w[key]): put(h, int(w[key]))
+            got = get(h)
+            print(f"gpu{i} {name}: {key} +{got} (want +{w[key]}{', was +%d' % before if before != got else ''})")
+            bad += got != int(w[key])
+        except Exception as e: print(f"gpu{i} {name}: {key} set FAILED: {e}"); bad += 1
+for u in set(want) - seen: print(f"{want[u].get('name', u)} {u}: not in this machine right now")
+sys.exit(1 if bad else 0)
+PY

@@ -1,0 +1,52 @@
+# ocsweep.conf — copy to ocsweep.conf and edit. Every line is optional; these are the defaults.
+# UNITS: NVML memory offsets are TRANSFER-RATE MHz — the real clock moves by HALF (Afterburner shows half).
+#        Core offsets are plain MHz (same number as Afterburner).
+
+# ── memory sweep (core stays +0) ──
+MEM_START=500                 # first step
+MEM_STEPS="0:500 2000:200 2400:100 2600:50"   # "from-offset:step" — steps shrink as the offset climbs
+MEM_CEIL=5000                 # stop climbing here
+MEM_RES=50                    # after a failure, close the pass/fail gap down to this
+MEM_MARGIN=100                # candidate = highest pass - margin, then rounded down to MEM_ROUND
+BW_NOISE=0.005                # bandwidth noise allowance (0.5 %) for the "must scale with the clock" check
+
+# ── core check (memory stays +0): a few fixed offsets, stop at the first failure. Beyond +200 NVIDIA cores get
+#    sketchy, and the core barely helps LLM token generation (it helps prefill a little) ──
+CORE_STEPS="100 150 200"
+CORE_MARGIN=0                 # candidate = highest passing step (at most the largest in CORE_STEPS) - margin
+
+# ── thermal guard (checked every MON_SECS during every test) ──
+VRAM_TEMP_STOP=90             # memory junction °C: stop the test at once (only on cards vramtemp knows)
+CORE_TEMP_LIMIT=75            # GPU core °C ...
+CORE_TEMP_LIMIT_SECS=60       # ... for this long in a row: stop the test
+CORE_TEMP_STOP=85             # GPU core °C: stop at once
+COOL_VRAM=65                  # after a thermal stop, wait until memory is below this ...
+COOL_CORE=50                  # ... and the core below this, then retry the step once
+MON_SECS=2
+
+# ── tests ──
+GPUBURN_SECS=120
+MEMTEST_ARGS="--stress --num_passes 1 --num_iterations 3000"
+SETTLE=10                     # seconds after each clock change
+WD_SECS=60                    # driver silent this long → hard reboot (only in --auto mode)
+
+# ── optional T4: a real LLM request whose output must stay bit-identical to stock (catches SILENT corruption,
+#    e.g. a core overclock that computes wrong numbers without crashing). Leave LLAMA_SERVER or T4_MODEL empty
+#    to skip it. The model must fit on every card you sweep, with T4_CTX context.
+LLAMA_SERVER=""               # ABSOLUTE path recommended: the background service does not have your shell PATH
+LLAMA_LIBRARY_PATH=""         # extra LD_LIBRARY_PATH for llama-server, if it needs one
+T4_MODEL=""                   # a small GGUF (~4 GiB) that fits your smallest card with T4_CTX context
+T4_CTX=16384
+T4_PORT=8092
+
+# CUDA_HOME=/usr/local/cuda   # only if build.sh cannot find nvcc (a toolkit outside PATH and /usr/local)
+# OCSWEEP_DATA=               # where state, queue and logs go (default: ./data next to this file)
+
+# ── soak (phase 3): memory + core TOGETHER at sensible numbers ──
+MEM_ROUND=200                 # candidates are rounded DOWN to this (200 NVML = 100 Afterburner): the edge is not what you live with
+CORE_ROUND=25
+SOAK_SECS=1800                # length of the combined test
+SOAK_BURN_SECS=300            # gpu_burn length inside each soak cycle
+SOAK_ISO_SECS=600             # memory-alone isolation run after an unclear failure
+SOAK_MAX_TRIES=6
+SOAK_MAX_PAUSES=5             # heat pauses allowed before the soak is called "thermal-limited" (heat is never a clock failure)

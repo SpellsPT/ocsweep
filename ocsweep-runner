@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# ocsweep-runner — run by ocsweep.service (at boot, and by `ocsweep --start`). Works through data/queue (one GPU UUID
+# per line, in order) with `ocsweep --card UUID --execute --auto`. After a crash/reboot the service starts again and
+# each card resumes where it stopped. Disables the service when the queue is empty. Crash-loop guard: MAX_STARTS.
+set -uo pipefail
+D=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+OCSWEEP_DATA=""; CONF=${OCSWEEP_CONF:-$D/ocsweep.conf}; [ -f "$CONF" ] && . "$CONF"
+DATA=${OCSWEEP_DATA:-$D/data}; Q=$DATA/queue; N=$DATA/runner-starts; RL=$DATA/runs/runner.log; mkdir -p "$DATA/runs"
+MAX_STARTS=${MAX_STARTS:-25}
+log() { echo "$(date '+%F %T')  $*" | tee -a "$RL"; sync "$RL" 2>/dev/null; }
+finish() { rm -f "$Q" "$N"; sync; sudo -n systemctl disable ocsweep.service >/dev/null 2>&1; log "$1 — ocsweep.service disabled"; exit "${2:-0}"; }
+
+[ -s "$Q" ] || finish "queue empty"
+n=$(( $(cat "$N" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$N"; sync
+[ "$n" -le "$MAX_STARTS" ] || finish "GIVING UP after $MAX_STARTS starts (crash loop?) — read the logs" 1
+log "runner start #$n   queue: $(tr '\n' ' ' < "$Q")"
+sudo -n nvidia-smi -pm 1 >/dev/null 2>&1 || log "warning: persistence mode could not be enabled"
+while card=$(head -1 "$Q" 2>/dev/null); [ -n "$card" ]; do
+  log "card $card: ocsweep --execute --auto"
+  "$D/ocsweep" --card "$card" --execute --auto; rc=$?
+  case $rc in
+    0) log "card $card: finished" ;;
+    3) log "card $card: needs a reboot — the service resumes after boot"; exit 0 ;;
+    *) log "card $card: stopped with rc $rc — moving to the next card (see its log)" ;;
+  esac
+  sed -i '1d' "$Q"; sync
+done
+finish "all cards done"
