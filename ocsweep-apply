@@ -26,7 +26,11 @@ esac
 [ -s "$MAP" ] || { echo "nothing to apply ($MAP missing or empty)"; exit 0; }
 [ "${1:-}" = --boot ] && { echo "applied at boot $(cat /proc/sys/kernel/random/boot_id) $(date '+%F %T')" > "$PENDING"; sync; }
 for i in $(seq 1 30); do nvidia-smi -L >/dev/null 2>&1 && break; sleep 2; done
-nvidia-smi -pm 1 >/dev/null 2>&1 || echo "warning: persistence mode could not be enabled"
+# Driver-level changes only when needed: `nvidia-smi -pm 1` on a card that is already in persistence mode is not
+# free — a run of it landed 9 s into a llama.cpp request that then hung (unproven cause, but not worth the risk).
+if nvidia-smi --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null | grep -qv Enabled; then
+  nvidia-smi -pm 1 >/dev/null 2>&1 || echo "warning: persistence mode could not be enabled"
+fi
 python3 - "$MAP" <<'PY'
 import json, os, sys, pynvml as n
 want = json.load(open(sys.argv[1])); n.nvmlInit(); bad = 0; seen = set()
@@ -40,7 +44,8 @@ for i in range(n.nvmlDeviceGetCount()):
         if key not in w: continue
         try:
             before = get(h)
-            if before != int(w[key]): put(h, int(w[key]))
+            if before != int(w[key]):          # only ever write when the value was lost — reads alone while a card works
+            put(h, int(w[key]))
             got = get(h)
             print(f"gpu{i} {name}: {key} +{got} (want +{w[key]}{', was +%d' % before if before != got else ''})")
             bad += got != int(w[key])
