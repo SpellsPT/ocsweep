@@ -1,5 +1,11 @@
 # ocsweep
 
+> ⚠ **This project is vibe-coded.** It was written by an AI coding assistant (Anthropic's Claude), directed by a
+> hobbyist who is not a developer, and tested on **one** home test bench (one RTX 4070 and one RTX 2060, Ubuntu,
+> one driver version). It has not had a human code review. It runs parts of itself as **root**, changes GPU clocks,
+> deliberately crashes GPU drivers and reboots the machine. **Read the code before you run it, use it at your own
+> risk, and never on a machine you cannot afford to lose.** Provided as-is, without warranty (see [LICENSE](LICENSE)).
+
 Find how far an NVIDIA card's **memory** and **core** clocks can really go on Linux — automatically, one card at a
 time, headless and crash-proof — confirm a sensible combination with one long test, then keep the chosen numbers
 applied.

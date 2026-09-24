@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# ⚠ VIBE-CODED: written by an AI coding assistant (Claude) for a non-developer, tested on one two-GPU test bench,
+#   never reviewed by a human programmer. It runs parts of itself as root, crashes GPU drivers on purpose and
+#   reboots the machine. Read it before running it. Use at your own risk; no warranty (Apache-2.0, see LICENSE).
+#
 # ocsweep — find how far an NVIDIA card's MEMORY and CORE clocks can go, one card at a time, crash-proof. Linux,
 # headless, NVML offsets. Memory and core are tested SEPARATELY: memory first (core +0), core second (memory +0).
 #

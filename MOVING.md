@@ -1,5 +1,8 @@
 # Moving ocsweep to another machine
 
+> ⚠ **Vibe-coded**: written by an AI coding assistant for a non-developer, tested on a single two-GPU test bench,
+> never reviewed by a human programmer. Treat it as a useful experiment, not as proven software. See README.md.
+
 Written for whoever sets ocsweep up on a new box — a person or an AI coding session. Follow it top to bottom.
 
 ## 0. Before you start
