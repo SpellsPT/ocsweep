@@ -45,7 +45,7 @@ for i in range(n.nvmlDeviceGetCount()):
         try:
             before = get(h)
             if before != int(w[key]):          # only ever write when the value was lost — reads alone while a card works
-            put(h, int(w[key]))
+                put(h, int(w[key]))
             got = get(h)
             print(f"gpu{i} {name}: {key} +{got} (want +{w[key]}{', was +%d' % before if before != got else ''})")
             bad += got != int(w[key])

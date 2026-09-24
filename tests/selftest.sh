@@ -14,6 +14,10 @@ for f in ocsweep ocsweep-runner ocsweep-apply build.sh install-service.sh tests/
   bash -n "$D/$f" 2>"$T/err" && ok "$f" || bad "$f: $(head -1 "$T/err")"
 done
 
+echo "1b. Python embedded in the scripts compiles"
+awk -v dir="$T" '/<<.PY.$/ {n++; f=dir "/emb" n ".py"; on=1; next} /^PY$/ {on=0} on {print > f}' "$D/ocsweep" "$D/ocsweep-apply"
+for f in "$T"/emb*.py; do python3 -m py_compile "$f" 2>"$T/err" && ok "embedded block $(basename "$f")" || bad "embedded python: $(tail -1 "$T/err")"; done
+
 echo "2. memory step schedule and search (simulated cards)"
 { fn mem_step; fn mem_next; } > "$T/mn.sh"
 sim() {  # sim LIMIT PASS FAIL → the offsets tested and the highest pass, for a card that fails above LIMIT
