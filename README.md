@@ -88,6 +88,7 @@ Moving to another machine: see **[MOVING.md](MOVING.md)**.
 | `src/vramtemp.c` | GDDR6/6X memory-junction and hotspot temperature for GeForce cards |
 | `tests/selftest.sh` | logic tests that need no GPU |
 | `MOVING.md` | step-by-step setup on another machine |
+| `LICENSE` | Apache License 2.0 |
 
 Created on first use and never part of the package: `bin/`, `build/`, `third_party/` (per-machine builds),
 `data/` (state, queue, logs, step tables) and `ocsweep.conf` (this machine's settings).
@@ -107,4 +108,5 @@ Created on first use and never part of the package: `bin/`, `build/`, `third_par
 
 ## Licence
 
-Not chosen yet.
+[Apache License 2.0](LICENSE). gpu-burn (BSD-2) and cuda_memtest (NCSA) are not included here — `build.sh`
+downloads them from their own repositories under their own licences.
