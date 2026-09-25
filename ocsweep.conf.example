@@ -50,3 +50,9 @@ SOAK_BURN_SECS=300            # gpu_burn length inside each soak cycle
 SOAK_ISO_SECS=600             # memory-alone isolation run after an unclear failure
 SOAK_MAX_TRIES=6
 SOAK_MAX_PAUSES=5             # heat pauses allowed before the soak is called "thermal-limited" (heat is never a clock failure)
+# ── plateau check (EDC retry zone without errors): the bandwidth gain over the last TREND_SPAN of offset must be at least
+#    TREND_FRAC of what the card's OWN rate (stock → a passing step >= TREND_MIN_BASE) predicts. Catches gains that
+#    flatten over several small steps, which the per-step rule's noise allowance hides. TREND_FRAC=0 turns it off.
+TREND_SPAN=300
+TREND_FRAC=0.6
+TREND_MIN_BASE=1000

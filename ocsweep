@@ -21,7 +21,9 @@
 # MEMORY: steps from MEM_STEPS (default +500 below +2000, +200 to +2400, +100 to +2600, +50 above) until the first
 #   failure, then close the pass/fail gap down to MEM_RES. A step FAILS on: VRAM errors (vrambench, cuda_memtest),
 #   gpu_burn errors, a new kernel Xid, a changed T4 answer, or bandwidth NOT rising with the clock — GDDR6/6X
-#   error-corrects by retrying (EDC), so past the limit the clock goes up and the bandwidth does not.
+#   error-corrects by retrying (EDC), so past the limit the clock goes up and the bandwidth does not. Two bandwidth
+#   rules: each step vs the previous pass, and a PLATEAU rule (TREND_*): the gain over the last TREND_SPAN must keep
+#   pace with the card's own rate from stock; when gains flatten the search drops back to the last full-gain point.
 # CORE: a short check of fixed offsets, CORE_STEPS (default +100 +150 +200 — beyond +200 NVIDIA cores get sketchy,
 #   and core barely helps LLM token generation), stop at the first failure (gpu_burn errors, Xid, changed answer, hang).
 # SOAK (phase 3): both together, at sensible numbers — (highest pass - margin) rounded DOWN to MEM_ROUND / CORE_ROUND
@@ -42,6 +44,7 @@ D=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 # ── defaults (override in ocsweep.conf) ──
 MEM_START=500; MEM_STEPS="0:500 2000:200 2400:100 2600:50"; MEM_CEIL=5000; MEM_RES=50; MEM_MARGIN=100; MEM_ROUND=200; BW_NOISE=0.005
 CORE_STEPS="100 150 200"; CORE_MARGIN=0; CORE_ROUND=25
+TREND_SPAN=300; TREND_FRAC=0.6; TREND_MIN_BASE=1000; TREND_WHY=""; TREND_BACK=""
 SOAK_SECS=1800; SOAK_BURN_SECS=300; SOAK_ISO_SECS=600; SOAK_MAX_TRIES=6; SOAK_MAX_PAUSES=5
 VRAM_TEMP_STOP=90; CORE_TEMP_LIMIT=75; CORE_TEMP_LIMIT_SECS=60; CORE_TEMP_STOP=85; COOL_VRAM=65; COOL_CORE=50; MON_SECS=2
 GPUBURN_SECS=120; MEMTEST_ARGS="--stress --num_passes 1 --num_iterations 3000"; SETTLE=10; WD_SECS=60
@@ -279,6 +282,9 @@ for v in VRAM_TEMP_STOP CORE_TEMP_LIMIT CORE_TEMP_LIMIT_SECS CORE_TEMP_STOP COOL
          GPUBURN_SECS SOAK_SECS SOAK_BURN_SECS SOAK_ISO_SECS SOAK_MAX_TRIES SOAK_MAX_PAUSES MEM_MARGIN CORE_MARGIN CORE_ROUND T4_CTX T4_PORT; do
   x=${!v}; case "$x" in ""|*[!0-9]*) echo "$v must be a whole number (got '$x') — a bad value here would silently disable a safety check"; exit 2;; esac
 done
+for v in TREND_SPAN TREND_MIN_BASE; do x=${!v}; case "$x" in ""|*[!0-9]*) echo "$v must be a whole number"; exit 2;; esac; done
+[ $((TREND_SPAN % 2)) -eq 0 ] && [ "$TREND_SPAN" -ge 2 ] || { echo "TREND_SPAN must be even and at least 2"; exit 2; }
+awk -v f="$TREND_FRAC" 'BEGIN{exit !(f ~ /^[0-9]*\.?[0-9]+$/ && f >= 0 && f < 1)}' || { echo "TREND_FRAC must be a number from 0 (off) to below 1 (got '$TREND_FRAC')"; exit 2; }
 for v in MON_SECS CORE_ROUND SOAK_MAX_TRIES GPUBURN_SECS SOAK_BURN_SECS; do [ "${!v}" -ge 1 ] || { echo "$v must be at least 1"; exit 2; }; done
 CORE_MAX=0; for c in $CORE_STEPS; do case "$c" in *[!0-9]*|"") echo "CORE_STEPS must be numbers"; exit 2;; esac; [ "$c" -gt "$CORE_MAX" ] && CORE_MAX=$c; done
 [ "$MEM_CEIL" -le "$HARD_MEM" ] || { echo "refusing memory ceiling +$MEM_CEIL (hard max +$HARD_MEM)"; exit 2; }
@@ -577,6 +583,35 @@ bw_ok() {  # bw_ok BW_NOW BW_AT_PASS OFF_PASS OFF_NOW → 0 if bandwidth scaled 
     if (g < need) printf "bandwidth not scaling with clock: %.2f GB/s vs %.2f at +%d (clock +%.1f%% predicts +%.2f, got %+.2f, needed %+.2f) — EDC retry zone", a, b, p, 100*(cn/cp-1), e, g, need }')
   [ -z "$BW_WHY" ]
 }
+
+# Plateau check (the card's OWN gain rate): bw_ok compares one step with the previous pass, and with small steps its noise
+# allowance is bigger than the gain it expects — a step that gains NOTHING still passes. So also look back TREND_SPAN:
+# the gain from the highest pass at least TREND_SPAN below this step must be >= TREND_FRAC of what the card's average
+# rate (stock → that pass, a long span, so noise barely matters) predicts. When the gains flatten, that is the EDC retry
+# zone even with no error: the step fails and the search drops back to that last full-gain point.
+mem_passes() {  # "OFFSET BANDWIDTH" for every memory step that passed (bw_<offset> in the state), offset > 0
+  python3 - "$STATE" "$UUID" <<'PY'
+import json, sys, os
+f, u = sys.argv[1], sys.argv[2]
+d = json.load(open(f)).get(u, {}) if os.path.exists(f) else {}
+for k, v in d.items():
+    if k.startswith("bw_") and k[3:].isdigit() and int(k[3:]) > 0 and v not in ("", None): print(k[3:], v)
+PY
+}
+trend_ok() {  # trend_ok BW_NOW OFF_NOW → 0 if the gains still keep pace with the card's own rate; sets TREND_WHY, TREND_BACK
+  TREND_WHY=""; TREND_BACK=""
+  awk -v f="$TREND_FRAC" 'BEGIN{exit !(f > 0)}' || return 0          # TREND_FRAC=0 turns the check off
+  local bw0 line
+  bw0=$(sget bw_0); [ -n "$bw0" ] || return 0
+  line=$(mem_passes | awk -v n="$2" -v s="$TREND_SPAN" -v m="$TREND_MIN_BASE" 'BEGIN{a=-1} $1+0>=m && $1+0<=n-s && $1+0>a {a=$1+0; b=$2} END{if (a>=0) print a, b}')
+  [ -n "$line" ] || return 0                                              # not far enough above a solid pass yet
+  TREND_WHY=$(awk -v a="${line% *}" -v ba="${line#* }" -v n="$2" -v bn="$1" -v b0="$bw0" -v fr="$TREND_FRAC" 'BEGIN{
+    rate = (ba - b0) / (a/2); if (rate <= 0) exit                         # GB/s per real MHz, stock → +a
+    pred = rate * (n - a)/2; got = bn - ba
+    if (got < fr*pred) printf "bandwidth gain flattening: %+.2f GB/s from +%d to +%d, the card'"'"'s own rate predicts %+.2f (needed %.0f%% = %+.2f) — EDC retry zone; last full-gain point +%d", got, a, n, pred, 100*fr, fr*pred, a }')
+  [ -z "$TREND_WHY" ] && return 0
+  TREND_BACK=${line% *}; return 1
+}
 mem_step() {  # step size for the current highest pass, from MEM_STEPS "from:step ..."
   local p="$1" st=500 pair
   for pair in $MEM_STEPS; do [ "$p" -ge "${pair%%:*}" ] && st=${pair##*:}; done; echo "$st"
@@ -644,6 +679,7 @@ BUSY=$(nvidia-smi --query-compute-apps=pid,gpu_uuid,process_name --format=csv,no
 [ -z "$BUSY" ] || { [ $EXEC -eq 1 ] && die "card is in use: $BUSY"; log "  card in use: $BUSY"; }
 vt=$(sudo -n "$VRAMTEMP" "$BDF" 2>/dev/null)
 log "  memory: start +$MEM_START, steps [$MEM_STEPS], ceiling +$MEM_CEIL, close the gap to <= $MEM_RES; candidate = highest pass - $MEM_MARGIN, rounded down to $MEM_ROUND"
+log "  plateau: the gain over the last +$TREND_SPAN must be >= $TREND_FRAC x the card's own rate (stock → a pass >= +$TREND_MIN_BASE); TREND_FRAC=0 = off"
 log "  core:   check +${CORE_STEPS// /, +}, stop at first failure; candidate = highest pass (at most +$CORE_MAX) - $CORE_MARGIN"
 log "  soak:   both together for $((SOAK_SECS/60)) min (gpu_burn ${SOAK_BURN_SECS}s cycles); memory-only isolation $((SOAK_ISO_SECS/60)) min; max $SOAK_MAX_TRIES tries"
 log "  thermal guard: memory >= ${VRAM_TEMP_STOP}°C, core >= ${CORE_TEMP_STOP}°C, core > ${CORE_TEMP_LIMIT}°C for ${CORE_TEMP_LIMIT_SECS}s   now: core $(q temperature.gpu)°C, $vt"
@@ -732,6 +768,7 @@ fi
 
 step() {  # step mem|core OFFSET → 0 pass, 1 fail, 2 thermal (twice)
   local kind="$1" n="$2" try p bwp
+  TREND_BACK=""                     # only a plateau failure of THIS step may send the search back down
   for try in 1 2; do
     set_off "$kind" "$n"; sleep "$SETTLE"
     battery "$kind" "$n"
@@ -745,6 +782,7 @@ step() {  # step mem|core OFFSET → 0 pass, 1 fail, 2 thermal (twice)
     elif [ "$kind" = mem ]; then
       p=$(sget mem_pass); p=${p:-0}; bwp=$(sget "bw_$p")
       [ -n "$bwp" ] && ! bw_ok "$RES_BW" "$bwp" "$p" "$n" && RES_REASON="$BW_WHY"
+      [ -z "$RES_REASON" ] && ! trend_ok "$RES_BW" "$n" && RES_REASON="$TREND_WHY"
     fi
   fi
   [ -z "$RES_REASON" ]
@@ -763,6 +801,9 @@ if [ "$phase" = mem ] && [[ ",$PHASES," == *,mem,* ]]; then
       log "THERMAL LIMIT at memory +$n (not a clock failure) — memory sweep ends at the last clean step"; set_off mem 0; break
     elif [ $rc -ne 0 ]; then
       sset mem_fail "$n"; sset mem_fail_reason "$RES_REASON"; sset testing ""; record_step mem "$n" FAIL "$RES_REASON"; log "FAILED memory +$n: $RES_REASON"
+      if [ -n "$TREND_BACK" ] && [ "$TREND_BACK" -lt "$(sget mem_pass)" ]; then     # the gains flattened BELOW the last pass
+        sset mem_pass "$TREND_BACK"; log "  back to the last full-gain point +$TREND_BACK — the passes above it gained too little to trust"
+      fi
       set_off mem 0; sleep "$SETTLE"      # a ResetRequired shows up here → reboot, resume carries on
     else
       sset "bw_$n" "$RES_BW"; sset testing ""; sset mem_pass "$n"; record_step mem "$n" PASS ""; log "PASSED memory +$n"

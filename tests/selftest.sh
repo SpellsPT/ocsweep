@@ -42,6 +42,43 @@ bw 7001 345.32 343.03 2400 2500 && ok "real data: +0.67 % bandwidth for +0.6 % c
 bw 7001 300.5 300.0 1000 1500   && bad "flat bandwidth over +500 accepted" || ok "flat bandwidth over a +500 step fails"
 bw 7001 344.2 345.32 2500 2550  && ok "0.3 % dip on a tiny step is noise" || bad "noise rejected"
 
+echo "3b. plateau rule: gains that FLATTEN over small steps fail even without errors (card's own rate)"
+{ fn bw_ok; fn trend_ok; fn mem_step; fn mem_next; } > "$T/tr.sh"
+# tr BW_NOW OFF_NOW "OFF:BW ..." → trend_ok against a fake card (stock 504 GB/s) with those passes recorded
+tr() { bash -c 'source "$1"; TREND_SPAN=300; TREND_FRAC=0.6; TREND_MIN_BASE=1000
+  L=$4; sget() { [ "$1" = bw_0 ] && echo 504; }; mem_passes() { for x in $L; do echo "${x%%:*} ${x##*:}"; done; }
+  trend_ok "$2" "$3"; rc=$?; echo "rc=$rc back=$TREND_BACK"' _ "$T/tr.sh" "$@"; }
+# a 4070-like card: +2000 (=+1000 real MHz) gave +45 GB/s → 0.045 GB/s per real MHz → +300 predicts +6.75
+r=$(tr 555.7 2300 "2000:549"); [[ "$r" == "rc=0 "* ]] && ok "full gain over +300 passes ($r)" || bad "full gain rejected: $r"
+r=$(tr 549.3 2300 "2000:549"); [[ "$r" == "rc=1 back=2000" ]] && ok "flat over +300 fails, back to +2000 ($r)" || bad "flat accepted: $r"
+r=$(tr 551.5 2300 "2000:549"); [[ "$r" == "rc=1 "* ]] && ok "only 37 % of the predicted gain fails" || bad "weak gain accepted: $r"
+r=$(tr 549.5 2200 "2000:549"); [[ "$r" == "rc=0 "* ]] && ok "not yet +300 above a pass → no verdict" || bad "judged too early: $r"
+r=$(tr 520 800 "500:510");     [[ "$r" == "rc=0 "* ]] && ok "below TREND_MIN_BASE → no verdict" || bad "min base ignored: $r"
+r=$(bash -c 'source "$1"; TREND_SPAN=300; TREND_FRAC=0; TREND_MIN_BASE=1000; sget(){ echo 504; }; mem_passes(){ echo "2000 549"; }; trend_ok 540 2300; echo rc=$?' _ "$T/tr.sh")
+[ "$r" = "rc=0" ] && ok "TREND_FRAC=0 turns it off" || bad "off switch: $r"
+# full search on a simulated card: bandwidth rises normally up to a hidden KNEE, then goes FLAT — no errors ever.
+plat() {  # plat KNEE → the offsets tested and the final pass (MEM_START=2000, steps of 100 then 50, like hermespt)
+  bash -c '
+    source "$1"; K=$2; MEM_START=2000; MEM_STEPS="0:100 2600:50"; MEM_CEIL=5000; MEM_RES=50; BW_NOISE=0.005
+    TREND_SPAN=300; TREND_FRAC=0.6; TREND_MIN_BASE=1000
+    declare -A S=([mem_pass]=0 [bw_0]=504 [mclk_0]=10501); sget() { echo "${S[$1]:-}"; }
+    mem_passes() { for k in "${!S[@]}"; do [[ $k == bw_* ]] && [ "${k#bw_}" -gt 0 ] && echo "${k#bw_} ${S[$k]}"; done; }
+    bwat() { awk -v o=$1 -v k=$K "BEGIN{e=(o<k?o:k); j=((o/100)%3-1)*0.4; printf \"%.2f\", 504*(1+0.9*(e/2)/10501)+j}"; }
+    seq=""; i=0; while n=$(mem_next); [ "$n" != done ]; do i=$((i+1)); [ $i -gt 60 ] && { echo "LOOP"; exit; }
+      bw=$(bwat $n); p=${S[mem_pass]}; why=""
+      [ "$p" -gt 0 ] && ! bw_ok "$bw" "${S[bw_$p]}" "$p" "$n" && why=bw
+      [ -z "$why" ] && ! trend_ok "$bw" "$n" && why=trend
+      if [ -z "$why" ]; then S[mem_pass]=$n; S[bw_$n]=$bw; seq+="$n+ "
+      else S[mem_fail]=$n; seq+="$n-($why) "; [ -n "$TREND_BACK" ] && [ "$TREND_BACK" -lt "${S[mem_pass]}" ] && S[mem_pass]=$TREND_BACK; fi
+    done; echo "$seq| ${S[mem_pass]}"' _ "$T/tr.sh" "$@"
+}
+for K in 2350 2700 3000; do
+  r=$(plat $K); h=${r##*| }
+  if [[ "$r" == *LOOP* ]]; then bad "knee +$K: search did not end ($r)"
+  elif [ "$h" -ge $((K - 150)) ] && [ "$h" -le $((K + 150)) ]; then ok "flat above +$K (no errors) → final pass +$h, within 150  ($r)"
+  else bad "knee +$K: final pass +$h  ($r)"; fi
+done
+
 echo "4. a test that leaves a helper process behind cannot hang the sweep"
 { fn run_test; } > "$T/rt.sh"
 start=$(date +%s)
