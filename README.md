@@ -73,7 +73,7 @@ cp ocsweep.conf.example ocsweep.conf # optional: limits, steps, the LLM check
 tail -f data/runs/*.log              # watch (expect reboots when a memory step fails)
 ./ocsweep --report                   # per-step tables: offset, clock, bandwidth, LLM speed, temperatures, result
 ./ocsweep --stop                     # stop; the running step is recorded as NOT tested
-./ocsweep --apply 0 3000 100         # USE offsets on card 0: now, at every boot, re-checked every 15 min
+./ocsweep --apply 0 3000 100 1 2000 50   # USE offsets (card mem core, repeatable): now, at boot, every 15 min
 ./ocsweep --unapply 0                # stop managing card 0 and put it back to stock
 ./ocsweep --status                   # sweep state, queue, what is applied, any crash hold
 ```

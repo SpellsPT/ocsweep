@@ -80,6 +80,7 @@ time with `./ocsweep --stop`.
 
 ```bash
 ./ocsweep --apply 0 3000 100     # card 0: memory +3000 (NVML units), core +100 — now, at boot, re-checked every 15 min
+./ocsweep --apply 0 3000 100 1 2000 50   # several cards in one go (do this on a first install)
 ./ocsweep --unapply 0            # back to stock, no longer managed
 ./ocsweep --status               # sweep state + what is applied + any crash hold
 ```
