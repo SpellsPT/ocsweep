@@ -56,3 +56,7 @@ SOAK_MAX_PAUSES=5             # heat pauses allowed before the soak is called "t
 TREND_SPAN=300
 TREND_FRAC=0.6
 TREND_MIN_BASE=1000
+# ── on a failure ──
+MEM_FIRST_FAIL_ENDS=0         # 1 = the FIRST memory failure (error or plateau) is the answer: no gap-closing steps, fewer reboots
+GPU_RESET=1                   # a card that needs a reset: try `nvidia-smi --gpu-reset` on THAT card first (only if nothing else
+RESET_MAX=3                   #   is on it), reboot only if that fails or after RESET_MAX resets. The step still FAILS.

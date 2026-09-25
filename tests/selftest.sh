@@ -79,6 +79,35 @@ for K in 2350 2700 3000; do
   else bad "knee +$K: final pass +$h  ($r)"; fi
 done
 
+echo "3c. first memory failure (error OR plateau) ends the search — no extra steps, no extra reboots"
+r=$(bash -c 'source "$1"; MEM_START=2000; MEM_STEPS="0:100 2600:50"; MEM_CEIL=5000; MEM_RES=50; MEM_FIRST_FAIL_ENDS=1
+  declare -A S=([mem_pass]=2300 [mem_fail]=2400); sget() { echo "${S[$1]:-}"; }; mem_next' _ "$T/tr.sh")
+[ "$r" = done ] && ok "pass +2300, fail +2400 → done at once (answer +2300)" || bad "kept searching: $r"
+r=$(bash -c 'source "$1"; MEM_START=2000; MEM_STEPS="0:100 2600:50"; MEM_CEIL=5000; MEM_RES=50; MEM_FIRST_FAIL_ENDS=0
+  declare -A S=([mem_pass]=2300 [mem_fail]=2400); sget() { echo "${S[$1]:-}"; }; mem_next' _ "$T/tr.sh")
+[ "$r" = 2350 ] && ok "MEM_FIRST_FAIL_ENDS=0 keeps the old gap-closing (+2350)" || bad "default changed: $r"
+
+echo "3d. a card that needs a reset: reset THIS card, reboot only as a fallback — and the step still FAILS"
+{ fn card_reset; fn need_reset; } > "$T/rs.sh"
+mkdir -p "$T/bin"
+printf '#!/bin/sh\n[ "$1" = -n ] && shift; exec "$@"\n' > "$T/bin/sudo"
+printf '#!/bin/sh\ncase "$*" in *query-compute-apps*) [ -n "${FAKE_BUSY:-}" ] && echo "GPU-X, 123, python";; *gpu-reset*) echo reset >> "$FAKE_LOG"; exit ${FAKE_RESET_RC:-0};; esac\n' > "$T/bin/nvidia-smi"
+chmod +x "$T/bin/sudo" "$T/bin/nvidia-smi"
+rs() {  # rs RESETS_SO_FAR ALIVE_AFTER → "rc=<need_reset rc> reason=<RES_REASON> resets=<n> rebooted=<0|1>"
+  FAKE_LOG="$T/fl" PATH="$T/bin:$PATH" bash -c 'source "$1"; EXEC=1; GPU_RESET=1; RESET_MAX=3; SETTLE=0; UUID=GPU-X; CLOG=/dev/null
+    declare -A S=([resets]=$2); sget() { echo "${S[$1]:-}"; }; sset() { S[$1]=$2; }; log() { :; }
+    A=$3; driver_alive() { [ "$A" = 1 ]; }; RB=0; reboot_box() { RB=1; }; RES_REASON=""
+    need_reset "T1 hung"; rc=$?; echo "rc=$rc reason=$RES_REASON resets=${S[resets]} rebooted=$RB"' _ "$T/rs.sh" "$@"; }
+: > "$T/fl"; r=$(rs 0 1); [[ "$r" == "rc=0 reason=T1 hung — card reset, no reboot resets=1 rebooted=0" ]] && [ -s "$T/fl" ] && ok "reset works → no reboot, step marked failed ($r)" || bad "reset path: $r"
+r=$(rs 0 0);  [[ "$r" == *"rebooted=1" ]] && ok "card still dead after the reset → reboot" || bad "dead card not rebooted: $r"
+r=$(rs 3 1);  [[ "$r" == *"resets=3 rebooted=1" ]] && ok "RESET_MAX reached → reboot instead of a 4th reset" || bad "reset loop: $r"
+r=$(FAKE_RESET_RC=1 rs 0 1); [[ "$r" == *"rebooted=1" ]] && ok "reset command fails → reboot" || bad "failed reset ignored: $r"
+r=$(FAKE_BUSY=1 rs 0 1); [[ "$r" == *"resets=0 rebooted=1" ]] && ok "something else on the card → never reset it, reboot" || bad "reset a busy card: $r"
+r=$(FAKE_LOG="$T/fl" PATH="$T/bin:$PATH" bash -c 'source "$1"; EXEC=1; GPU_RESET=0; RESET_MAX=3; SETTLE=0; UUID=GPU-X; CLOG=/dev/null
+  sget() { echo 0; }; sset() { :; }; log() { :; }; driver_alive() { true; }; card_reset && echo reset || echo no' _ "$T/rs.sh")
+[ "$r" = no ] && ok "GPU_RESET=0 → never resets (old behaviour: reboot)" || bad "GPU_RESET=0 ignored: $r"
+grep -q 'driver_alive || reboot_box "card unresponsive' "$D/ocsweep" && bad "a test still reboots without trying a card reset" || ok "every test's reset path goes through need_reset"
+
 echo "4. a test that leaves a helper process behind cannot hang the sweep"
 { fn run_test; } > "$T/rt.sh"
 start=$(date +%s)

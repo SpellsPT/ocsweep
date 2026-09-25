@@ -45,6 +45,7 @@ D=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 MEM_START=500; MEM_STEPS="0:500 2000:200 2400:100 2600:50"; MEM_CEIL=5000; MEM_RES=50; MEM_MARGIN=100; MEM_ROUND=200; BW_NOISE=0.005
 CORE_STEPS="100 150 200"; CORE_MARGIN=0; CORE_ROUND=25
 TREND_SPAN=300; TREND_FRAC=0.6; TREND_MIN_BASE=1000; TREND_WHY=""; TREND_BACK=""
+MEM_FIRST_FAIL_ENDS=0; GPU_RESET=1; RESET_MAX=3
 SOAK_SECS=1800; SOAK_BURN_SECS=300; SOAK_ISO_SECS=600; SOAK_MAX_TRIES=6; SOAK_MAX_PAUSES=5
 VRAM_TEMP_STOP=90; CORE_TEMP_LIMIT=75; CORE_TEMP_LIMIT_SECS=60; CORE_TEMP_STOP=85; COOL_VRAM=65; COOL_CORE=50; MON_SECS=2
 GPUBURN_SECS=120; MEMTEST_ARGS="--stress --num_passes 1 --num_iterations 3000"; SETTLE=10; WD_SECS=60
@@ -282,6 +283,8 @@ for v in VRAM_TEMP_STOP CORE_TEMP_LIMIT CORE_TEMP_LIMIT_SECS CORE_TEMP_STOP COOL
          GPUBURN_SECS SOAK_SECS SOAK_BURN_SECS SOAK_ISO_SECS SOAK_MAX_TRIES SOAK_MAX_PAUSES MEM_MARGIN CORE_MARGIN CORE_ROUND T4_CTX T4_PORT; do
   x=${!v}; case "$x" in ""|*[!0-9]*) echo "$v must be a whole number (got '$x') — a bad value here would silently disable a safety check"; exit 2;; esac
 done
+for v in MEM_FIRST_FAIL_ENDS GPU_RESET; do case "${!v}" in 0|1) ;; *) echo "$v must be 0 or 1"; exit 2;; esac; done
+case "$RESET_MAX" in ""|*[!0-9]*) echo "RESET_MAX must be a whole number"; exit 2;; esac
 for v in TREND_SPAN TREND_MIN_BASE; do x=${!v}; case "$x" in ""|*[!0-9]*) echo "$v must be a whole number"; exit 2;; esac; done
 [ $((TREND_SPAN % 2)) -eq 0 ] && [ "$TREND_SPAN" -ge 2 ] || { echo "TREND_SPAN must be even and at least 2"; exit 2; }
 awk -v f="$TREND_FRAC" 'BEGIN{exit !(f ~ /^[0-9]*\.?[0-9]+$/ && f >= 0 && f < 1)}' || { echo "TREND_FRAC must be a number from 0 (off) to below 1 (got '$TREND_FRAC')"; exit 2; }
@@ -338,6 +341,23 @@ reboot_box() {  # graceful reboot (the driver still answers, e.g. NVML ResetRequ
   log "not in --auto mode: reboot the box yourself, then ./ocsweep --start again (or re-run with --execute)"; exit 3
 }
 
+card_reset() {  # reset ONLY this card (nvidia-smi --gpu-reset) instead of rebooting the box → 0 = the card is usable again
+  [ $EXEC -eq 1 ] && [ "$GPU_RESET" = 1 ] || return 1
+  local n busy; n=$(sget resets); n=${n:-0}
+  [ "$n" -lt "$RESET_MAX" ] || { log "card reset: already $n on this card (RESET_MAX) — rebooting instead"; return 1; }
+  busy=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name --format=csv,noheader 2>/dev/null | grep -F "$UUID")
+  [ -z "$busy" ] || { log "card reset impossible — something else is on the card: $busy"; return 1; }
+  sset resets $((n + 1)); log "trying a reset of THIS card only (nvidia-smi --gpu-reset), not a reboot"
+  timeout -k 5 120 sudo -n nvidia-smi --gpu-reset -i "$UUID" >> "$CLOG" 2>&1 || { log "card reset FAILED"; return 1; }
+  sleep "$SETTLE"; driver_alive || { log "card still unusable after the reset"; return 1; }
+  log "card reset OK — no reboot (the reset put the card back to stock clocks)"; return 0
+}
+need_reset() {  # need_reset REASON — mid-test: reset the card, else reboot. After a reset the STEP FAILS: the reset put the
+  # card back to stock, so anything tested afterwards would be a false pass at stock clocks.
+  card_reset && { RES_REASON="$1 — card reset, no reboot"; return 0; }
+  reboot_box "$1"
+}
+
 nvml() {  # nvml mem|core get | nvml mem|core set OFFSET   → prints the offset read back
   timeout -k 5 30 sudo -n python3 - "$UUID" "$@" <<'PY'
 import sys, pynvml as n
@@ -357,7 +377,10 @@ set_off() {  # set_off mem|core OFFSET
   if [ $EXEC -eq 0 ]; then log "[dry-run] would: $what offset +$off"; return 0; fi
   TOUCHED=1
   got=$(nvml "$what" set "$off" 2>&1 | tail -1)
-  case "$got" in *ResetRequired*) reboot_box "GPU requires a reset (NVML ResetRequired) setting $what +$off — normal after a failed step" ;; esac
+  case "$got" in *ResetRequired*)
+    card_reset || reboot_box "GPU requires a reset (NVML ResetRequired) setting $what +$off — normal after a failed step"
+    got=$(nvml "$what" set "$off" 2>&1 | tail -1) ;; esac                # the card was reset: set it again
+  [ "$got" = "$off" ] || driver_alive || { card_reset && got=$(nvml "$what" set "$off" 2>&1 | tail -1); }
   [ "$got" = "$off" ] || { driver_alive || reboot_box "driver unresponsive setting $what +$off"
                            sset testing ""   # never tested: must not be recorded as a failure on the next start
                            die "$what offset readback '$got' != $off"; }
@@ -534,20 +557,20 @@ battery_inner() {
   if [ "$kind" = mem ]; then
     run_test "$D" "$RUN/t1-$tag.log" 180 "$VRAMBENCH" "$VB_MB" 40; rc=$?; out=$OUT
     thermal_hit && return 1
-    driver_alive || reboot_box "card unresponsive or needs a reset after T1 at $kind +$off"
+    driver_alive || { need_reset "card unresponsive or needs a reset after T1 at $kind +$off"; return 1; }
     [ $rc -eq 0 ] || { RES_REASON="T1 vrambench rc=$rc"; return 1; }
     RES_BW=$(echo "$out" | tail -1 | awk '{print $1}')
     [ "$(echo "$out" | tail -1 | awk '{print $2}')" = 0 ] || { RES_REASON="T1 mismatches=$(echo "$out" | tail -1 | awk '{print $2}')"; return 1; }
     log "  T1 vrambench  $RES_BW GB/s  0 mismatches (every element, address-dependent data)"
     run_test "$(dirname "$MEMTEST_BIN")" "$RUN/t2-$tag.log" 600 "$MEMTEST_BIN" $MEMTEST_ARGS; rc=$?; out=$OUT
     thermal_hit && return 1
-    driver_alive || reboot_box "card unresponsive or needs a reset after T2 at $kind +$off"
+    driver_alive || { need_reset "card unresponsive or needs a reset after T2 at $kind +$off"; return 1; }
     if [ $rc -ne 0 ] || echo "$out" | grep -aqE 'ERROR:|FAIL|FAULT|not progressing'; then RES_REASON="T2 cuda_memtest (rc=$rc)"; return 1; fi
     log "  T2 cuda_memtest  clean"
   fi
   run_test "$GPUBURN_DIR" "$RUN/t3-$tag.log" $((GPUBURN_SECS + 120)) ./gpu_burn -tc "$GPUBURN_SECS"; rc=$?; out=$OUT
   thermal_hit && return 1
-  driver_alive || reboot_box "card unresponsive or needs a reset after T3 at $kind +$off"
+  driver_alive || { need_reset "card unresponsive or needs a reset after T3 at $kind +$off"; return 1; }
   if [ $rc -ne 0 ] || echo "$out" | grep -aq FAULTY || ! echo "$out" | grep -aqE 'GPU 0: OK'; then RES_REASON="T3 gpu_burn (rc=$rc)"; return 1; fi
   log "  T3 gpu_burn ${GPUBURN_SECS}s  OK"
   t4_once "$RUN/t4-$tag.log"; local t4rc=$?
@@ -555,7 +578,7 @@ battery_inner() {
     log "  T4 setup problem ($RES_REASON) — retrying once in 20 s"; sleep 20; t4_once "$RUN/t4-$tag.log"; t4rc=$?
     [ $t4rc -eq 2 ] && { sset testing ""; die "the LLM check (T4) could not start twice: $RES_REASON (log: $RUN/t4-$tag.log). A setup problem, not a clock failure — fix it and start again; this step will be re-tested"; }
   fi
-  if [ $t4rc -ne 0 ]; then thermal_hit; driver_alive || reboot_box "card unresponsive or needs a reset after T4 at $kind +$off"; return 1; fi
+  if [ $t4rc -ne 0 ]; then thermal_hit; driver_alive || need_reset "card unresponsive or needs a reset after T4 at $kind +$off"; return 1; fi
   [ $T4_ON -eq 1 ] && log "  T4 llama  hash $RES_HASH  prefill $RES_PP t/s  gen $RES_TG t/s"
   [ "$(xid_count)" -gt "$x0" ] && { RES_REASON="new kernel Xid: $(sudo -n journalctl -k -b --no-pager | grep -E "\\bXid \\(PCI:${BDF%.*}\\)" | tail -1 | cut -c1-120)"; return 1; }
   return 0
@@ -624,6 +647,7 @@ mem_next() {  # prints the next memory offset to test, or "done"
     if [ "$p" -eq 0 ]; then n=$MEM_START; else n=$((p + st)); fi
     [ "$n" -gt "$MEM_CEIL" ] && n=$MEM_CEIL
   else
+    [ "$MEM_FIRST_FAIL_ENDS" = 1 ] && { echo done; return; }   # first error OR plateau = this card's answer
     [ $((f - p)) -le "$MEM_RES" ] && { echo done; return; }
     half=$(( (f - p) / 2 )); [ "$half" -lt "$st" ] && st=$half; n=$((p + st))
   fi
@@ -679,6 +703,7 @@ BUSY=$(nvidia-smi --query-compute-apps=pid,gpu_uuid,process_name --format=csv,no
 [ -z "$BUSY" ] || { [ $EXEC -eq 1 ] && die "card is in use: $BUSY"; log "  card in use: $BUSY"; }
 vt=$(sudo -n "$VRAMTEMP" "$BDF" 2>/dev/null)
 log "  memory: start +$MEM_START, steps [$MEM_STEPS], ceiling +$MEM_CEIL, close the gap to <= $MEM_RES; candidate = highest pass - $MEM_MARGIN, rounded down to $MEM_ROUND"
+log "  on a failure: $([ "$MEM_FIRST_FAIL_ENDS" = 1 ] && echo "the FIRST memory failure (error or plateau) ends the memory search" || echo "close the gap to <= +$MEM_RES"); a card that needs a reset: $([ "$GPU_RESET" = 1 ] && echo "reset the card (max $RESET_MAX), reboot only if that fails" || echo reboot)"
 log "  plateau: the gain over the last +$TREND_SPAN must be >= $TREND_FRAC x the card's own rate (stock → a pass >= +$TREND_MIN_BASE); TREND_FRAC=0 = off"
 log "  core:   check +${CORE_STEPS// /, +}, stop at first failure; candidate = highest pass (at most +$CORE_MAX) - $CORE_MARGIN"
 log "  soak:   both together for $((SOAK_SECS/60)) min (gpu_burn ${SOAK_BURN_SECS}s cycles); memory-only isolation $((SOAK_ISO_SECS/60)) min; max $SOAK_MAX_TRIES tries"
