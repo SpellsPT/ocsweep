@@ -18,34 +18,38 @@
 #   FAIL_ON_UNMAPPED=1   a present GPU that is not in the map fails the check (a card swap cannot go unnoticed)
 #   ALERT_CMD="..."      run (as root, 30 s limit) with one message argument when a hold is set or a check fails
 #   APPLY_BOOT_BEFORE="unit.service ..."   read by `ocsweep --apply`: boot apply is ordered before these units
+#   CRASH_GUARD=0        no crash guard: --boot never writes the marker and never holds — always re-applies (for a box
+#                        whose unclean shutdowns are power cuts, not overclock crashes). Default 1.
 # Reads /etc/ocsweep/apply.json, keyed by GPU UUID (survives cards moving between slots):
 #   {"GPU-...": {"name": "<card name>", "mem": 1000, "core": 50}}
 set -u
-MAP=/etc/ocsweep/apply.json; V=/var/lib/ocsweep; PENDING=$V/boot-marker; HELD=$V/held; BOOTERR=$V/last-boot-error
+ETC=${OCSWEEP_ETC:-/etc/ocsweep}; V=${OCSWEEP_VARDIR:-/var/lib/ocsweep}; RUNDIR=${OCSWEEP_RUNDIR:-/run/ocsweep}   # overrides: tests only
+MAP=$ETC/apply.json; PENDING=$V/boot-marker; HELD=$V/held; BOOTERR=$V/last-boot-error
 MAX_MEM=8000; MAX_CORE=500          # same hard limits as `ocsweep --apply`
-APPLY_WHEN_BUSY=0; FAIL_ON_UNMAPPED=0; ALERT_CMD=""
-[ -f /etc/ocsweep/apply.conf ] && . /etc/ocsweep/apply.conf
+APPLY_WHEN_BUSY=0; FAIL_ON_UNMAPPED=0; ALERT_CMD=""; CRASH_GUARD=1
+[ -f "$ETC/apply.conf" ] && . "$ETC/apply.conf"
 alert() {  # alert MESSAGE — never blocks or fails the apply
   echo "ALERT: $1"
   [ -n "$ALERT_CMD" ] && timeout 30 sh -c "$ALERT_CMD \"\$1\"" _ "ocsweep-apply on $(hostname): $1" >/dev/null 2>&1
   return 0
 }
-mkdir -p "$V" /run/ocsweep
-exec 9>/run/ocsweep/apply.lock; flock 9   # one writer at a time: this helper, --apply/--unapply, a sweep starting
+mkdir -p "$V" "$RUNDIR"
+exec 9>"$RUNDIR/apply.lock"; flock 9   # one writer at a time: this helper, --apply/--unapply, a sweep starting
 
 MODE=${1:-check}
 case "$MODE" in
   --clean-shutdown) rm -f "$PENDING"; exit 0 ;;
   --boot)
     rm -f "$BOOTERR"
-    if [ -e "$PENDING" ]; then
+    if [ "$CRASH_GUARD" = 0 ]; then rm -f "$PENDING" "$HELD"      # guard off: never hold, never leave a marker
+    elif [ -e "$PENDING" ]; then
       echo "previous boot ended WITHOUT a clean shutdown after overclocks were applied ($(cat "$PENDING")) — not applying; holding until 'ocsweep --apply'" | tee "$HELD"
       rm -f "$PENDING"; alert "HOLD: $(cat "$HELD") — all managed cards stay at STOCK clocks"; exit 0
     fi ;;
 esac
-[ -e "$HELD" ] && { echo "HELD: $(cat "$HELD")"; exit 0; }
+[ "$CRASH_GUARD" != 0 ] && [ -e "$HELD" ] && { echo "HELD: $(cat "$HELD")"; exit 0; }
 [ -s "$MAP" ] || { echo "nothing to apply ($MAP missing or empty)"; exit 0; }
-[ "$MODE" = --boot ] && { echo "applied at boot $(cat /proc/sys/kernel/random/boot_id) $(date '+%F %T')" > "$PENDING"; sync; }
+[ "$MODE" = --boot ] && [ "$CRASH_GUARD" != 0 ] && { echo "applied at boot $(cat /proc/sys/kernel/random/boot_id) $(date '+%F %T')" > "$PENDING"; sync; }
 
 for i in $(seq 1 30); do nvidia-smi -L >/dev/null 2>&1 && break; sleep 2; done
 python3 - "$MAP" "$MAX_MEM" "$MAX_CORE" "$APPLY_WHEN_BUSY" "$FAIL_ON_UNMAPPED" <<'PY'
@@ -69,7 +73,7 @@ for i in range(n.nvmlDeviceGetCount()):
         if fail_unmapped: print(f"gpu{i} {u}: present but NOT in the map (FAIL_ON_UNMAPPED=1) — card swapped?"); bad += 1
         continue
     seen.add(u); w = want[u]; name = w.get("name", u)
-    if os.path.exists(f"/run/ocsweep/sweeping-{u}"): print(f"gpu{i} {name}: being swept right now — skipped"); continue
+    if os.path.exists(os.path.join(os.environ.get("OCSWEEP_RUNDIR", "/run/ocsweep"), f"sweeping-{u}")): print(f"gpu{i} {name}: being swept right now — skipped"); continue
     try:
         if n.nvmlDeviceGetPersistenceMode(h) != 1: n.nvmlDeviceSetPersistenceMode(h, 1)   # this card only, only if off
     except Exception as e: print(f"gpu{i} {name}: persistence mode: {e}")

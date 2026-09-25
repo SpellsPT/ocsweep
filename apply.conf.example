@@ -18,3 +18,8 @@
 # Run this (as root, 30 s limit) with one message argument when a crash hold is set or a check fails.
 # Example: ALERT_CMD="/usr/local/bin/notify-me"
 #ALERT_CMD=""
+
+# Crash guard (default 1): after an UNCLEAN shutdown that followed a boot-time apply, the next boot applies NOTHING
+# and holds until `ocsweep --apply` — so a bad overclock cannot reboot-loop the machine. On a box whose unclean
+# shutdowns are power cuts, that leaves every card at stock after each one; CRASH_GUARD=0 always re-applies instead.
+#CRASH_GUARD=0

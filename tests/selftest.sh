@@ -85,6 +85,23 @@ scen "unmapped card present, FAIL_ON_UNMAPPED=1 → FAILS"     ""      0 1 '[{"u
 scen "absurd value in the map → REFUSED, FAILS"              ""      0 0 '[{"uuid":"GPU-a","mem":0,"core":0}]' '{"GPU-a": {"mem": 20001, "core": 100}}' 1 "0:core=100"
 scen "mapped card not in the machine → skipped, OK"          ""      0 0 '[]' "$M" 0 ""
 
+echo "4c. crash guard (the real ocsweep-apply script, as a normal user, fake driver, temp dirs)"
+G="$T/g"; mkdir -p "$G/etc" "$G/var" "$G/run"; echo "$M" > "$G/etc/apply.json"
+boot() {  # boot MODE → runs ocsweep-apply with the card at stock; prints the writes it made
+  echo '{"cards": [{"uuid":"GPU-a","mem":0,"core":0}], "writes": []}' > "$T/fs.json"
+  FAKE_STATE="$T/fs.json" FAKE_BUSY="" PYTHONPATH="$T/fake" PATH="$T/fake/bin:$PATH" OCSWEEP_ETC="$G/etc" \
+    OCSWEEP_VARDIR="$G/var" OCSWEEP_RUNDIR="$G/run" bash "$D/ocsweep-apply" "$1" >/dev/null 2>&1
+  python3 -c "import json;print(' '.join(json.load(open('$T/fs.json'))['writes']))"
+}
+rm -f "$G/var/"*; : > "$G/etc/apply.conf"
+w=$(boot --boot); [ -n "$w" ] && [ -e "$G/var/boot-marker" ] && ok "guard ON: boot applies and arms the marker" || bad "guard ON first boot: writes '$w'"
+w=$(boot --boot); [ -z "$w" ] && [ -e "$G/var/held" ] && ok "guard ON: boot after an unclean shutdown applies NOTHING and holds" || bad "guard ON hold: writes '$w'"
+w=$(boot check); [ -z "$w" ] && ok "guard ON: 15-min check respects the hold" || bad "guard ON check wrote '$w'"
+echo "CRASH_GUARD=0" > "$G/etc/apply.conf"
+w=$(boot --boot); [ -n "$w" ] && [ ! -e "$G/var/boot-marker" ] && [ ! -e "$G/var/held" ] && ok "CRASH_GUARD=0: boot applies even after a hold, no marker, hold cleared" || bad "guard OFF boot: writes '$w'"
+: > "$G/var/boot-marker"
+w=$(boot --boot); [ -n "$w" ] && [ ! -e "$G/var/held" ] && ok "CRASH_GUARD=0: a leftover marker never causes a hold" || bad "guard OFF with marker: writes '$w'"
+
 echo "5. C sources compile"
 gcc -O2 -Wall -Werror -o "$T/vramtemp" "$D/src/vramtemp.c" 2>"$T/err" && ok "vramtemp.c" || bad "vramtemp.c: $(head -3 "$T/err")"
 "$T/vramtemp" 2>/dev/null; [ $? -eq 2 ] && ok "vramtemp prints usage without arguments" || bad "vramtemp usage"
