@@ -111,6 +111,13 @@ if [ $START -eq 1 ]; then
 fi
 # ── apply: keep chosen offsets on a card (ocsweep-apply + its timer, both run as root) ──
 APPLY_MAP=/etc/ocsweep/apply.json
+boot_unit() {  # boot_unit "UNITS-TO-RUN-BEFORE" → the ocsweep-apply-boot.service text on stdout
+  printf '%s\n' "[Unit]" "Description=ocsweep: apply GPU overclocks at boot (skipped after an unclean shutdown)" \
+    "After=nvidia-persistenced.service"
+  [ -n "$1" ] && printf 'Before=%s\n' "$1"
+  printf '%s\n' "[Service]" "Type=oneshot" "RemainAfterExit=yes" "ExecStart=$LIBEXEC/ocsweep-apply --boot" \
+    "ExecStop=$LIBEXEC/ocsweep-apply --clean-shutdown" "[Install]" "WantedBy=multi-user.target"
+}
 install_apply_units() {
   # never install a root helper that does not even compile (a broken one silently stops guarding the clocks)
   local chk; chk=$(mktemp -d)
@@ -124,8 +131,9 @@ install_apply_units() {
     "$APPLY_MAP" "$LIBEXEC/ocsweep-apply" | sudo -n tee /etc/systemd/system/ocsweep-apply.service >/dev/null
   # boot-time guard: applies once at boot and clears the crash marker on a CLEAN shutdown. If the machine died
   # (hang, watchdog reset) the marker survives and the next boot does NOT re-apply — no reboot loop.
-  printf '[Unit]\nDescription=ocsweep: apply GPU overclocks at boot (skipped after an unclean shutdown)\nAfter=nvidia-persistenced.service\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=%s --boot\nExecStop=%s --clean-shutdown\n[Install]\nWantedBy=multi-user.target\n' \
-    "$LIBEXEC/ocsweep-apply" "$LIBEXEC/ocsweep-apply" | sudo -n tee /etc/systemd/system/ocsweep-apply-boot.service >/dev/null
+  local before=""; before=$(sudo -n bash -c '. /etc/ocsweep/apply.conf 2>/dev/null; echo "${APPLY_BOOT_BEFORE:-}"')
+  [ -f /etc/ocsweep/apply.conf ] || sudo -n install -o root -g root -m 644 "$D/apply.conf.example" /etc/ocsweep/apply.conf
+  boot_unit "$before" | sudo -n tee /etc/systemd/system/ocsweep-apply-boot.service >/dev/null
   printf '[Unit]\nDescription=ocsweep: re-check the GPU overclocks every 15 min\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=15min\n[Install]\nWantedBy=timers.target\n' \
     | sudo -n tee /etc/systemd/system/ocsweep-apply.timer >/dev/null
   sudo -n systemctl daemon-reload && sudo -n systemctl enable ocsweep-apply-boot.service >/dev/null 2>&1 \
@@ -207,6 +215,8 @@ if [ $STATUS -eq 1 ]; then
     else echo "== last 15-min check: FAILED ($r, $t) — your clocks are NOT being guarded: journalctl -u ocsweep-apply -n 20"; fi
     echo "== boot apply: $(systemctl is-active ocsweep-apply-boot.service)$(sudo -n test -e /var/lib/ocsweep/last-boot-error && echo " — PROBLEM: $(sudo -n cat /var/lib/ocsweep/last-boot-error)")"
   fi
+  opts=$(sudo -n grep -E '^[A-Z_]+=' /etc/ocsweep/apply.conf 2>/dev/null | tr '\n' ' ')
+  [ -n "$opts" ] && echo "== apply options (/etc/ocsweep/apply.conf): $opts"
   [ -e /var/lib/ocsweep/held ] && echo "== HELD: $(cat /var/lib/ocsweep/held) — nothing is applied until you run --apply again"; exit 0
 fi
 if [ $REPORT -eq 1 ]; then

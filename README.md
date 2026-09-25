@@ -45,6 +45,11 @@ bound); it helps prompt processing a little. Beyond about +200 MHz NVIDIA cores 
 - **Watchdogs** — every test has a timeout and runs in its own process group (nothing it leaves behind can hang
   the sweep); a card that reports "needs a reset" or a silent driver triggers a save-and-reboot; optionally the
   board's hardware watchdog resets a frozen kernel.
+- **Apply never passes silently** — a card whose offset was lost but that is busy with a job is not written by
+  default (changing clocks under a running job can hang it) and the check FAILS, so you see it. Inference boxes
+  whose cards are never idle set `APPLY_WHEN_BUSY=1` (and `APPLY_BOOT_BEFORE=<llm.service>`) in
+  `/etc/ocsweep/apply.conf`; `FAIL_ON_UNMAPPED=1` catches a swapped card; `ALERT_CMD` notifies you. See
+  `apply.conf.example`.
 - **Apply crash guard** — if the machine does not shut down cleanly after offsets were applied at boot (a hang,
   a watchdog reset), the next boot applies nothing and holds until you run `--apply` again. No reboot loops.
 - **Root runs only root-owned code** — the helpers that run as root are installed to `/usr/local/libexec/ocsweep/`.
@@ -89,7 +94,8 @@ Moving to another machine: see **[MOVING.md](MOVING.md)**.
 | `ocsweep-apply` | run as root by `ocsweep-apply-boot.service` and `ocsweep-apply.timer`: applies `/etc/ocsweep/apply.json` |
 | `build.sh` | builds `vrambench`, `vramtemp`, gpu-burn and cuda_memtest for the GPUs present (third-party code at pinned commits) |
 | `install-service.sh` | installs the sweep service, the root-owned helpers, optionally the hardware watchdog; `--uninstall` |
-| `ocsweep.conf.example` | every setting with its default and an explanation |
+| `ocsweep.conf.example` | every sweep setting with its default and an explanation |
+| `apply.conf.example` | options for keeping offsets applied (`/etc/ocsweep/apply.conf`): busy cards, boot ordering, unmapped cards, alerts |
 | `src/vrambench.cu` | memory bandwidth + address-dependent error check |
 | `src/vramtemp.c` | GDDR6/6X memory-junction and hotspot temperature for GeForce cards |
 | `tests/selftest.sh` | logic tests that need no GPU |

@@ -84,6 +84,13 @@ time with `./ocsweep --stop`.
 ./ocsweep --status               # sweep state + what is applied + any crash hold
 ```
 
+**On a box whose cards are always busy** (an LLM server starts seconds after boot), edit `/etc/ocsweep/apply.conf`
+(created by the first `--apply`): set `APPLY_WHEN_BUSY=1` and `APPLY_BOOT_BEFORE="<your-llm>.service"`, then run
+`--apply` once more so the boot unit picks up the ordering. Without that, lost offsets on busy cards are reported
+as a FAILED check (never silently skipped) but not re-written. Add `ALERT_CMD` if you want a message on failures
+or a crash hold. If an older tool already keeps offsets applied, `--apply` the SAME values first, then disable the
+old tool, so two appliers never fight.
+
 Pick numbers below the highest pass — the report's soak line is the recommendation. If the machine ever dies
 without a clean shutdown after applying at boot, the next boot applies nothing (a "hold") until you run
 `--apply` again — so a bad offset cannot cause a reboot loop. NVML memory offsets are

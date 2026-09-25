@@ -49,6 +49,42 @@ out=$(timeout 30 bash -c 'source "$1"; RUN="$2"; UUID=none; run_test "$2" "$2/lo
 [ "$out" = "rc=7" ] && [ $(( $(date +%s) - start )) -lt 10 ] && ok "returns at once with the test's exit code" || bad "run_test: '$out'"
 if ps -eo args | awk '$1=="sleep" && $2=="300"' | grep -q .; then bad "leftover helper still running"; else ok "leftover helper killed"; fi
 
+echo "4b. apply decisions (the real ocsweep-apply logic against a FAKE driver — no GPU touched)"
+mkdir -p "$T/fake/bin"
+cat > "$T/fake/pynvml.py" <<'FAKE'
+import json, os
+S = json.load(open(os.environ["FAKE_STATE"]))          # {"cards": [{"uuid","mem","core"}], "writes": []}
+def _save(): json.dump(S, open(os.environ["FAKE_STATE"], "w"))
+def nvmlInit(): pass
+def nvmlDeviceGetCount(): return len(S["cards"])
+def nvmlDeviceGetHandleByIndex(i): return i
+def nvmlDeviceGetUUID(h): return S["cards"][h]["uuid"]
+def nvmlDeviceGetPersistenceMode(h): return 1
+def nvmlDeviceSetPersistenceMode(h, v): pass
+def nvmlDeviceGetMemClkVfOffset(h): return S["cards"][h]["mem"]
+def nvmlDeviceGetGpcClkVfOffset(h): return S["cards"][h]["core"]
+def nvmlDeviceSetMemClkVfOffset(h, v): S["cards"][h]["mem"] = v; S["writes"].append(f"{h}:mem={v}"); _save()
+def nvmlDeviceSetGpcClkVfOffset(h, v): S["cards"][h]["core"] = v; S["writes"].append(f"{h}:core={v}"); _save()
+FAKE
+printf '#!/bin/sh\nprintf "%%s\\n" $FAKE_BUSY\n' > "$T/fake/bin/nvidia-smi"; chmod +x "$T/fake/bin/nvidia-smi"
+awk -v f="$T/apply.py" '/<<.PY.$/ {on=1; next} /^PY$/ {on=0} on {print > f}' "$D/ocsweep-apply"
+scen() {  # scen "why" BUSY_UUIDS WHEN_BUSY FAIL_UNMAPPED CARDS_JSON MAP_JSON EXPECT_RC EXPECT_WRITES
+  echo "{\"cards\": $5, \"writes\": []}" > "$T/fs.json"; echo "$6" > "$T/map.json"
+  out=$(FAKE_STATE="$T/fs.json" FAKE_BUSY="$2" PYTHONPATH="$T/fake" PATH="$T/fake/bin:$PATH" \
+        python3 "$T/apply.py" "$T/map.json" 8000 500 "$3" "$4" 2>&1); rc=$?
+  w=$(python3 -c "import json;print(' '.join(json.load(open('$T/fs.json'))['writes']))")
+  [ "$rc" = "$7" ] && [ "$w" = "$8" ] && ok "$1 (rc $rc, writes: ${w:-none})" || bad "$1: rc $rc (want $7), writes '$w' (want '$8') — $out"
+}
+M='{"GPU-a": {"name": "A", "mem": 2000, "core": 100}}'
+scen "idle card lost its offsets → written"                 ""      0 0 '[{"uuid":"GPU-a","mem":0,"core":0}]'    "$M" 0 "0:mem=2000 0:core=100"
+scen "busy card lost its offsets → NOT written, check FAILS" "GPU-a" 0 0 '[{"uuid":"GPU-a","mem":0,"core":0}]'    "$M" 1 ""
+scen "busy card, APPLY_WHEN_BUSY=1 → written"                "GPU-a" 1 0 '[{"uuid":"GPU-a","mem":0,"core":0}]'    "$M" 0 "0:mem=2000 0:core=100"
+scen "busy card already correct → nothing written, OK"       "GPU-a" 0 0 '[{"uuid":"GPU-a","mem":2000,"core":100}]' "$M" 0 ""
+scen "unmapped card present, FAIL_ON_UNMAPPED=0 → ignored"   ""      0 0 '[{"uuid":"GPU-a","mem":2000,"core":100},{"uuid":"GPU-b","mem":0,"core":0}]' "$M" 0 ""
+scen "unmapped card present, FAIL_ON_UNMAPPED=1 → FAILS"     ""      0 1 '[{"uuid":"GPU-a","mem":2000,"core":100},{"uuid":"GPU-b","mem":0,"core":0}]' "$M" 1 ""
+scen "absurd value in the map → REFUSED, FAILS"              ""      0 0 '[{"uuid":"GPU-a","mem":0,"core":0}]' '{"GPU-a": {"mem": 20001, "core": 100}}' 1 "0:core=100"
+scen "mapped card not in the machine → skipped, OK"          ""      0 0 '[]' "$M" 0 ""
+
 echo "5. C sources compile"
 gcc -O2 -Wall -Werror -o "$T/vramtemp" "$D/src/vramtemp.c" 2>"$T/err" && ok "vramtemp.c" || bad "vramtemp.c: $(head -3 "$T/err")"
 "$T/vramtemp" 2>/dev/null; [ $? -eq 2 ] && ok "vramtemp prints usage without arguments" || bad "vramtemp usage"

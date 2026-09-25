@@ -10,13 +10,26 @@
 # writes /var/lib/ocsweep/held. Nothing is applied again until someone runs `ocsweep --apply` (which lifts the hold).
 # --boot always exits 0 (a failed start would make systemd skip ExecStop, and a normal reboot would then look like
 # a crash); its problems go to /var/lib/ocsweep/last-boot-error, which `ocsweep --status` shows.
-# Cards are skipped when: not in the map, being swept (/run/ocsweep/sweeping-<UUID>), or busy with a compute job
-# (never change clocks under a running job — the next check retries). Values outside the limits below are refused.
+# Cards are skipped when: not in the map, or being swept (/run/ocsweep/sweeping-<UUID>). A card busy with a compute
+# job whose offset was LOST is not written (unless APPLY_WHEN_BUSY=1) and counts as a FAILURE — never a silent pass.
+# Values outside the limits below are refused.
+# Options (root-owned /etc/ocsweep/apply.conf, all optional — see apply.conf.example):
+#   APPLY_WHEN_BUSY=1    write lost offsets even under a running job (for inference boxes whose cards are never idle)
+#   FAIL_ON_UNMAPPED=1   a present GPU that is not in the map fails the check (a card swap cannot go unnoticed)
+#   ALERT_CMD="..."      run (as root, 30 s limit) with one message argument when a hold is set or a check fails
+#   APPLY_BOOT_BEFORE="unit.service ..."   read by `ocsweep --apply`: boot apply is ordered before these units
 # Reads /etc/ocsweep/apply.json, keyed by GPU UUID (survives cards moving between slots):
 #   {"GPU-...": {"name": "<card name>", "mem": 1000, "core": 50}}
 set -u
 MAP=/etc/ocsweep/apply.json; V=/var/lib/ocsweep; PENDING=$V/boot-marker; HELD=$V/held; BOOTERR=$V/last-boot-error
 MAX_MEM=8000; MAX_CORE=500          # same hard limits as `ocsweep --apply`
+APPLY_WHEN_BUSY=0; FAIL_ON_UNMAPPED=0; ALERT_CMD=""
+[ -f /etc/ocsweep/apply.conf ] && . /etc/ocsweep/apply.conf
+alert() {  # alert MESSAGE — never blocks or fails the apply
+  echo "ALERT: $1"
+  [ -n "$ALERT_CMD" ] && timeout 30 sh -c "$ALERT_CMD \"\$1\"" _ "ocsweep-apply on $(hostname): $1" >/dev/null 2>&1
+  return 0
+}
 mkdir -p "$V" /run/ocsweep
 exec 9>/run/ocsweep/apply.lock; flock 9   # one writer at a time: this helper, --apply/--unapply, a sweep starting
 
@@ -27,7 +40,7 @@ case "$MODE" in
     rm -f "$BOOTERR"
     if [ -e "$PENDING" ]; then
       echo "previous boot ended WITHOUT a clean shutdown after overclocks were applied ($(cat "$PENDING")) — not applying; holding until 'ocsweep --apply'" | tee "$HELD"
-      rm -f "$PENDING"; exit 0
+      rm -f "$PENDING"; alert "HOLD: $(cat "$HELD") — all managed cards stay at STOCK clocks"; exit 0
     fi ;;
 esac
 [ -e "$HELD" ] && { echo "HELD: $(cat "$HELD")"; exit 0; }
@@ -35,10 +48,11 @@ esac
 [ "$MODE" = --boot ] && { echo "applied at boot $(cat /proc/sys/kernel/random/boot_id) $(date '+%F %T')" > "$PENDING"; sync; }
 
 for i in $(seq 1 30); do nvidia-smi -L >/dev/null 2>&1 && break; sleep 2; done
-python3 - "$MAP" "$MAX_MEM" "$MAX_CORE" <<'PY'
+python3 - "$MAP" "$MAX_MEM" "$MAX_CORE" "$APPLY_WHEN_BUSY" "$FAIL_ON_UNMAPPED" <<'PY'
 import json, os, subprocess, sys
 import pynvml as n
 f, max_mem, max_core = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+when_busy, fail_unmapped = sys.argv[4] == "1", sys.argv[5] == "1"
 try: want = json.load(open(f))
 except Exception as e: print(f"{f} is not valid JSON: {e}"); sys.exit(1)
 if not want: print("map is empty — nothing to do"); sys.exit(0)
@@ -51,7 +65,9 @@ try:
 except Exception: pass
 for i in range(n.nvmlDeviceGetCount()):
     h = n.nvmlDeviceGetHandleByIndex(i); u = n.nvmlDeviceGetUUID(h); u = u.decode() if isinstance(u, bytes) else u
-    if u not in want: continue
+    if u not in want:
+        if fail_unmapped: print(f"gpu{i} {u}: present but NOT in the map (FAIL_ON_UNMAPPED=1) — card swapped?"); bad += 1
+        continue
     seen.add(u); w = want[u]; name = w.get("name", u)
     if os.path.exists(f"/run/ocsweep/sweeping-{u}"): print(f"gpu{i} {name}: being swept right now — skipped"); continue
     try:
@@ -66,8 +82,10 @@ for i in range(n.nvmlDeviceGetCount()):
                 print(f"gpu{i} {name}: {key} +{target} REFUSED (allowed 0..{limit}{', even' if key == 'mem' else ''})"); bad += 1; continue
             before = get(h)
             if before != target:
-                if u in busy:                # never change clocks under a running job; the next check retries
-                    print(f"gpu{i} {name}: {key} is +{before}, want +{target} — card busy, not changed now"); continue
+                if u in busy and not when_busy:   # never change clocks under a running job — but never pass silently
+                    print(f"gpu{i} {name}: {key} is +{before}, want +{target} — card busy, NOT changed (FAILURE; set APPLY_WHEN_BUSY=1 for always-busy cards)")
+                    bad += 1; continue
+                if u in busy: print(f"gpu{i} {name}: card busy — writing anyway (APPLY_WHEN_BUSY=1)")
                 put(h, target)               # only ever write when the value was lost
             got = get(h)
             print(f"gpu{i} {name}: {key} +{got} (want +{target}{', was +%d' % before if before != got else ''})")
@@ -78,7 +96,8 @@ sys.exit(1 if bad else 0)
 PY
 rc=$?
 if [ "$MODE" = --boot ]; then          # never fail the boot unit: a failed start would skip ExecStop (see top)
-  [ $rc -eq 0 ] || echo "boot apply had problems (rc $rc) at $(date '+%F %T') — journalctl -u ocsweep-apply-boot" > "$BOOTERR"
+  if [ $rc -ne 0 ]; then echo "boot apply had problems (rc $rc) at $(date '+%F %T') — journalctl -u ocsweep-apply-boot" > "$BOOTERR"; alert "$(cat "$BOOTERR")"; fi
   exit 0
 fi
+[ $rc -eq 0 ] || alert "check failed (rc $rc) — clocks may be wrong: journalctl -u ocsweep-apply -n 20"
 exit $rc

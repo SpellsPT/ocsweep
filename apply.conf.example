@@ -1,0 +1,18 @@
+# /etc/ocsweep/apply.conf — options for ocsweep-apply (the part that keeps chosen offsets applied). Root-owned.
+# `ocsweep --apply` installs this file (commented out) if it is missing. Every line is optional.
+
+# A card busy with a compute job whose offset was LOST (e.g. after a reboot) is normally NOT written — changing
+# clocks under a running job can hang it — and the check FAILS so you see it. On an inference box whose cards are
+# never idle (an LLM server starting seconds after boot), set this to 1 to write anyway.
+#APPLY_WHEN_BUSY=1
+
+# Order the boot apply BEFORE these units, so offsets are set before the jobs start (space-separated unit names).
+# Takes effect on the next `ocsweep --apply`.
+#APPLY_BOOT_BEFORE="my-llm.service my-stt.service"
+
+# A GPU that is present but not in /etc/ocsweep/apply.json fails the check (a card swap cannot go unnoticed).
+#FAIL_ON_UNMAPPED=1
+
+# Run this (as root, 30 s limit) with one message argument when a crash hold is set or a check fails.
+# Example: ALERT_CMD="/usr/local/bin/notify-me"
+#ALERT_CMD=""
