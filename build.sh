@@ -48,26 +48,28 @@ done
 pinned "$D/third_party/gpu-burn" "$GPUBURN_REPO" "$GPUBURN_REF"
 for a in $ARCHS; do
   o="$D/bin/gpu-burn-sm$a"
-  [ -x "$o/gpu_burn" ] && continue
+  [ -x "$o/gpu_burn" ] && [ "$(cat "$o/.ref" 2>/dev/null)" = "$GPUBURN_REF" ] && continue
   echo "building gpu-burn sm_$a"
   rm -rf "$D/build/gpu-burn-sm$a"; cp -a "$D/third_party/gpu-burn" "$D/build/gpu-burn-sm$a"
   make -s -C "$D/build/gpu-burn-sm$a" COMPUTE="$a" CUDAPATH="$CUDA" >/dev/null
-  mkdir -p "$o"; cp "$D/build/gpu-burn-sm$a/gpu_burn" "$D/build/gpu-burn-sm$a/compare.fatbin" "$o/"
+  mkdir -p "$o"; cp "$D/build/gpu-burn-sm$a/gpu_burn" "$D/build/gpu-burn-sm$a/compare.fatbin" "$o/"; echo "$GPUBURN_REF" > "$o/.ref"
 done
 
 # ── cuda_memtest: one binary for all architectures ──
-want=$(echo $ARCHS | tr ' ' ';')
+want="$(echo $ARCHS | tr ' ' ';') $MEMTEST_REF"
 if [ ! -x "$D/bin/cuda_memtest" ] || [ "$(cat "$D/bin/cuda_memtest.archs" 2>/dev/null)" != "$want" ]; then
   pinned "$D/third_party/cuda_memtest" "$MEMTEST_REPO" "$MEMTEST_REF"
   echo "building cuda_memtest for $want"
   rm -rf "$D/build/cuda_memtest"
   cmake -S "$D/third_party/cuda_memtest" -B "$D/build/cuda_memtest" -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_CUDA_COMPILER="$NVCC" -DCMAKE_CUDA_ARCHITECTURES="$want" >/dev/null
+        -DCMAKE_CUDA_COMPILER="$NVCC" -DCMAKE_CUDA_ARCHITECTURES="${want%% *}" >/dev/null
   make -s -C "$D/build/cuda_memtest" -j"$(nproc)" >/dev/null
   cp "$D/build/cuda_memtest/cuda_memtest" "$D/bin/"; echo "$want" > "$D/bin/cuda_memtest.archs"
 fi
 { echo "built $(date '+%F %T') on $(hostname) with $NVCC"; echo "archs: $ARCHS"
   echo "gpu-burn $GPUBURN_REF  cuda_memtest $MEMTEST_REF"; } > "$D/bin/BUILD_INFO"
 echo "done:"; ls "$D/bin"
-[ -x /usr/local/libexec/ocsweep/vramtemp ] && ! cmp -s "$D/bin/vramtemp" /usr/local/libexec/ocsweep/vramtemp && \
+if [ -x /usr/local/libexec/ocsweep/vramtemp ] && ! cmp -s "$D/bin/vramtemp" /usr/local/libexec/ocsweep/vramtemp; then
   echo "note: bin/vramtemp changed — run ./install-service.sh to update the root-owned copy"
+fi
+exit 0

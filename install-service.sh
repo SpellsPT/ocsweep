@@ -29,6 +29,7 @@ ConditionPathExists=$DATA/queue
 [Service]
 Type=simple
 User=$U
+Environment=OCSWEEP_CONF=$CONF
 # let the box settle after boot before stressing a GPU
 ExecStartPre=/bin/sleep 60
 ExecStart=$D/ocsweep-runner

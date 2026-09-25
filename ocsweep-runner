@@ -14,7 +14,10 @@ finish() { rm -f "$Q" "$N"; sync; sudo -n systemctl disable ocsweep.service >/de
 n=$(( $(cat "$N" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$N"; sync
 [ "$n" -le "$MAX_STARTS" ] || finish "GIVING UP after $MAX_STARTS starts (crash loop?) — read the logs" 1
 log "runner start #$n   queue: $(tr '\n' ' ' < "$Q")"
-sudo -n nvidia-smi -pm 1 >/dev/null 2>&1 || log "warning: persistence mode could not be enabled"
+for u in $(cat "$Q"); do    # persistence mode on the queued cards only, and only if it is off
+  nvidia-smi -i "$u" --query-gpu=persistence_mode --format=csv,noheader 2>/dev/null | grep -q Enabled || \
+    sudo -n nvidia-smi -i "$u" -pm 1 >/dev/null 2>&1 || log "warning: persistence mode could not be enabled on $u"
+done
 while card=$(head -1 "$Q" 2>/dev/null); [ -n "$card" ]; do
   log "card $card: ocsweep --execute --auto"
   "$D/ocsweep" --card "$card" --execute --auto; rc=$?
@@ -25,4 +28,5 @@ while card=$(head -1 "$Q" 2>/dev/null); [ -n "$card" ]; do
   esac
   sed -i '1d' "$Q"; sync
 done
+[ -x /usr/local/libexec/ocsweep/ocsweep-apply ] && sudo -n systemctl start --no-block ocsweep-apply.service 2>/dev/null   # chosen offsets back
 finish "all cards done"

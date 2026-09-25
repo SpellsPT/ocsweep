@@ -131,9 +131,9 @@ install_apply_units() {
   sudo -n systemctl daemon-reload && sudo -n systemctl enable ocsweep-apply-boot.service >/dev/null 2>&1 \
     && sudo -n systemctl enable --now ocsweep-apply.timer >/dev/null 2>&1
 }
-map_edit() {  # map_edit set UUID NAME MEM CORE | map_edit del UUID
-  sudo -n mkdir -p /etc/ocsweep
-  sudo -n python3 - "$APPLY_MAP" "$@" <<'PY'
+map_edit() {  # map_edit set UUID NAME MEM CORE | map_edit del UUID — under the same lock ocsweep-apply takes
+  sudo -n mkdir -p /etc/ocsweep /run/ocsweep
+  sudo -n flock /run/ocsweep/apply.lock python3 - "$APPLY_MAP" "$@" <<'PY'
 import json, os, sys
 f, op, u = sys.argv[1], sys.argv[2], sys.argv[3]
 d = json.load(open(f)) if os.path.exists(f) else {}
@@ -162,29 +162,50 @@ if [ $APPLY -eq 1 ]; then
       echo "Run this again when the card is idle, or add --force to change it anyway."; exit 1
     fi
   fi
-  map_edit set "$u" "$n" "$m" "$k"; install_apply_units
-  sudo -n rm -f /var/lib/ocsweep/held       # an explicit --apply lifts a crash hold
-  sudo -n systemctl start ocsweep-apply.service; rc=$?
-  journalctl -u ocsweep-apply.service -n 6 --no-pager -o cat
+  map_edit set "$u" "$n" "$m" "$k" || { echo "could not update $APPLY_MAP — nothing changed"; exit 1; }
+  install_apply_units
+  sudo -n rm -f /var/lib/ocsweep/held /var/lib/ocsweep/last-boot-error    # an explicit --apply lifts a crash hold
+  # restart the BOOT unit: clears the old marker, arms the crash guard for THIS boot, applies (a bad new offset that
+  # hangs the machine is then held on the very next boot, not applied once more)
+  sudo -n systemctl restart ocsweep-apply-boot.service
+  journalctl -u ocsweep-apply-boot.service -n 8 --no-pager -o cat | grep -E '^gpu|REFUSED|FAILED|HELD|busy'
+  if sudo -n test -e /var/lib/ocsweep/last-boot-error; then echo "PROBLEM: $(sudo -n cat /var/lib/ocsweep/last-boot-error)"; exit 1; fi
   echo "applied to $n: memory +$m (Afterburner +$((m/2))), core +$k — re-applied at every boot and checked every 15 min (ocsweep-apply.timer)"
-  exit $rc
+  exit 0
 fi
 if [ $UNAPPLY -eq 1 ]; then
-  [ ${#ARGS[@]} -eq 1 ] || { echo "usage: $0 --unapply <card>"; exit 2; }
-  u=$(nvidia-smi -i "${ARGS[0]}" --query-gpu=uuid --format=csv,noheader 2>/dev/null) || { echo "no card ${ARGS[0]}"; exit 2; }
-  map_edit del "$u"
-  sudo -n python3 -c "import pynvml as n; n.nvmlInit(); h=n.nvmlDeviceGetHandleByUUID('$u'); n.nvmlDeviceSetMemClkVfOffset(h,0); n.nvmlDeviceSetGpcClkVfOffset(h,0); print('back to stock: mem +%d core +%d' % (n.nvmlDeviceGetMemClkVfOffset(h), n.nvmlDeviceGetGpcClkVfOffset(h)))"
-  echo "no longer managed: $u (remaining in $APPLY_MAP: $(sudo -n python3 -c "import json;print(len(json.load(open('$APPLY_MAP'))))" 2>/dev/null || echo 0))"
-  exit 0
+  [ ${#ARGS[@]} -eq 1 ] || { echo "usage: $0 --unapply <card index or GPU-UUID> [--force]"; exit 2; }
+  present=1
+  u=$(nvidia-smi -i "${ARGS[0]}" --query-gpu=uuid --format=csv,noheader 2>/dev/null) || {
+    case "${ARGS[0]}" in GPU-*) u=${ARGS[0]}; present=0; echo "card not in this machine — removing it from the map only" ;; *) echo "no card ${ARGS[0]}"; exit 2 ;; esac; }
+  if [ $present -eq 1 ] && [ $FORCE -eq 0 ]; then
+    busy=$(nvidia-smi --query-compute-apps=pid,gpu_uuid,process_name --format=csv,noheader 2>/dev/null | awk -F', *' -v u="$u" '$2==u {print $1" "$3}')
+    [ -n "$busy" ] && { echo "refusing: the card is in use right now ($busy) — run again when it is idle, or add --force"; exit 1; }
+  fi
+  map_edit del "$u" || { echo "could not update $APPLY_MAP — nothing changed"; exit 1; }
+  rc=0
+  if [ $present -eq 1 ]; then   # reset under the apply lock, so a timer run cannot put the old offset back afterwards
+    sudo -n flock /run/ocsweep/apply.lock python3 -c "import pynvml as n; n.nvmlInit(); h=n.nvmlDeviceGetHandleByUUID('$u'); n.nvmlDeviceSetMemClkVfOffset(h,0); n.nvmlDeviceSetGpcClkVfOffset(h,0); print('back to stock: mem +%d core +%d' % (n.nvmlDeviceGetMemClkVfOffset(h), n.nvmlDeviceGetGpcClkVfOffset(h)))" || { echo "resetting the card FAILED — a reboot restores stock"; rc=1; }
+  fi
+  left=$(sudo -n python3 -c "import json;print(len(json.load(open('$APPLY_MAP'))))" 2>/dev/null || echo 0)
+  if [ "$left" = 0 ]; then       # nothing left to manage: switch the machinery off
+    sudo -n systemctl disable --now ocsweep-apply.timer >/dev/null 2>&1; sudo -n systemctl disable ocsweep-apply-boot.service >/dev/null 2>&1
+    sudo -n systemctl stop ocsweep-apply-boot.service 2>/dev/null
+    sudo -n rm -f /var/lib/ocsweep/boot-marker /var/lib/ocsweep/held /var/lib/ocsweep/last-boot-error
+    echo "no longer managed: $u — no cards left, apply timer and boot unit disabled"
+  else echo "no longer managed: $u ($left card(s) still in $APPLY_MAP)"; fi
+  exit $rc
 fi
 if [ $STATUS -eq 1 ]; then
   echo "== $STATE"; [ -e "$STATE" ] && state dump || echo "  none yet"
   echo "== queue: $(tr '\n' ' ' 2>/dev/null < "$QUEUE" || echo empty)   service: $(systemctl is-active ocsweep.service 2>/dev/null)"
   echo "== applied ($APPLY_MAP, timer: $(systemctl is-active ocsweep-apply.timer 2>/dev/null)):"; { sudo -n cat "$APPLY_MAP" 2>/dev/null && echo; } || echo "  nothing"
-  if systemctl cat ocsweep-apply.service >/dev/null 2>&1; then
+  if [ -e /var/lib/ocsweep/held ]; then :
+  elif systemctl cat ocsweep-apply.service >/dev/null 2>&1; then
     r=$(systemctl show -p Result --value ocsweep-apply.service); t=$(systemctl show -p ExecMainExitTimestamp --value ocsweep-apply.service)
-    if [ "$r" = success ]; then echo "== last check: OK (${t:-not run yet this boot})"
-    else echo "== last check: FAILED ($r, $t) — your clocks are NOT being guarded: journalctl -u ocsweep-apply -n 20"; fi
+    if [ "$r" = success ]; then echo "== last 15-min check: OK (${t:-not run yet this boot})"
+    else echo "== last 15-min check: FAILED ($r, $t) — your clocks are NOT being guarded: journalctl -u ocsweep-apply -n 20"; fi
+    echo "== boot apply: $(systemctl is-active ocsweep-apply-boot.service)$(sudo -n test -e /var/lib/ocsweep/last-boot-error && echo " — PROBLEM: $(sudo -n cat /var/lib/ocsweep/last-boot-error)")"
   fi
   [ -e /var/lib/ocsweep/held ] && echo "== HELD: $(cat /var/lib/ocsweep/held) — nothing is applied until you run --apply again"; exit 0
 fi
@@ -235,6 +256,11 @@ for v in MEM_START MEM_CEIL MEM_RES MEM_ROUND; do
 done
 for pair in $MEM_STEPS; do st=${pair##*:}; case "$st" in ""|*[!0-9]*) echo "MEM_STEPS: bad entry '$pair'"; exit 2;; esac
   { [ "$st" -ge 2 ] && [ $((st % 2)) -eq 0 ]; } || { echo "MEM_STEPS: step $st must be even and at least 2"; exit 2; }; done
+for v in VRAM_TEMP_STOP CORE_TEMP_LIMIT CORE_TEMP_LIMIT_SECS CORE_TEMP_STOP COOL_VRAM COOL_CORE MON_SECS SETTLE WD_SECS \
+         GPUBURN_SECS SOAK_SECS SOAK_BURN_SECS SOAK_ISO_SECS SOAK_MAX_TRIES SOAK_MAX_PAUSES MEM_MARGIN CORE_MARGIN CORE_ROUND T4_CTX T4_PORT; do
+  x=${!v}; case "$x" in ""|*[!0-9]*) echo "$v must be a whole number (got '$x') — a bad value here would silently disable a safety check"; exit 2;; esac
+done
+for v in MON_SECS CORE_ROUND SOAK_MAX_TRIES GPUBURN_SECS SOAK_BURN_SECS; do [ "${!v}" -ge 1 ] || { echo "$v must be at least 1"; exit 2; }; done
 CORE_MAX=0; for c in $CORE_STEPS; do case "$c" in *[!0-9]*|"") echo "CORE_STEPS must be numbers"; exit 2;; esac; [ "$c" -gt "$CORE_MAX" ] && CORE_MAX=$c; done
 [ "$MEM_CEIL" -le "$HARD_MEM" ] || { echo "refusing memory ceiling +$MEM_CEIL (hard max +$HARD_MEM)"; exit 2; }
 [ "$CORE_MAX" -le "$HARD_CORE" ] || { echo "refusing core step +$CORE_MAX (hard max +$HARD_CORE)"; exit 2; }
@@ -257,7 +283,7 @@ TS=$(date +%Y%m%d_%H%M%S); ID=${UUID:4:8}; RUN=$DATA/runs/$ID-$TS; mkdir -p "$RU
 CLOG=$DATA/runs/$ID.log            # one continuous log per card, across every resume/reboot
 STEPS_CSV=$DATA/runs/$ID-steps.csv
 [ $EXEC -eq 1 ] || CLOG=$RUN/dryrun.log
-T4_PID=""; WD_PID=""; MON_PID=""; VT_PID=""; TOUCHED=0; T4_ON=0
+T4_PID=""; WD_PID=""; MON_PID=""; VT_PID=""; TOUCHED=0; T4_ON=0; FLAG_MINE=0
 RES_BW=""; RES_PP=""; RES_TG=""; RES_HASH=""; RES_REASON=""; RES_THERMAL=0; STAT_CORE=—; STAT_HOT=—; STAT_VRAM=—; STAT_PMAX=—; STAT_REASONS=—
 [ -n "$LLAMA_SERVER" ] && [ -x "$LLAMA_SERVER" ] && [ -n "$T4_MODEL" ] && [ -f "$T4_MODEL" ] && T4_ON=1
 
@@ -278,7 +304,7 @@ run_test() {  # run_test DIR LOG TIMEOUT cmd... → rc; output appended to LOG a
   kill -KILL -- "-$pid" 2>/dev/null; rm -f "$RUN/cur.pgid"
   OUT=$(cat "$RUN/cur.out"); cat "$RUN/cur.out" >> "$log"; return $rc
 }
-xid_count() { sudo -n journalctl -k -b --no-pager 2>/dev/null | grep -cE '\bXid\b'; }
+xid_count() { sudo -n journalctl -k -b --no-pager 2>/dev/null | grep -cE "\\bXid \\(PCI:${BDF%.*}\\)"; }   # this card only: "Xid (PCI:0000:07:00): …"
 pin() { CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$UUID" "$@"; }
 
 reboot_box() {  # graceful reboot (the driver still answers, e.g. NVML ResetRequired)
@@ -340,8 +366,15 @@ vt_start() {  # one root vramtemp loop per run (exits by itself when this script
   sudo -n "$VRAMTEMP" -l "$VT_FILE" -i "$MON_SECS" -p $$ "$BDF" >/dev/null 2>&1 &
   VT_PID=$!
 }
-vt_read() {  # → VT_VRAM VT_HOT ("" when unknown)
-  local l; l=$(cat "$VT_FILE" 2>/dev/null)
+vt_read() {  # → VT_VRAM VT_HOT ("" when unknown or stale)
+  local l age
+  age=$(( $(date +%s) - $(stat -c %Y "$VT_FILE" 2>/dev/null || echo 0) ))
+  if [ "$age" -gt $((3 * MON_SECS + 2)) ]; then
+    VT_VRAM=""; VT_HOT=""
+    [ -e "$RUN/vt-stale" ] || { : > "$RUN/vt-stale"; [ -e "$VT_FILE" ] && echo "$(date '+%F %T')    note: memory-temperature reader stopped updating — core temperature only from now" >> "$CLOG"; }
+    return
+  fi
+  l=$(cat "$VT_FILE" 2>/dev/null)
   VT_VRAM=$(echo "$l" | grep -o 'vram=[0-9]*' | cut -d= -f2); VT_HOT=$(echo "$l" | grep -o 'hotspot=[0-9]*' | cut -d= -f2)
 }
 kill_card_jobs() {  # stop the test in progress: its whole process group, plus any compute process on this card
@@ -361,6 +394,7 @@ mon_start() {  # mon_start TAG → $RUN/mon-TAG.csv; $RUN/thermal-stop appears i
     while :; do
       line=$(timeout -k 2 8 nvidia-smi -i "$UUID" --query-gpu=temperature.gpu,power.draw,clocks.sm,clocks.mem,clocks_event_reasons.active --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
       vt_read; now=$(date +%s); core=${line%%,*}
+      [ -n "$line" ] || line=",,,,"
       echo "$now,$line,$VT_HOT,$VT_VRAM" >> "$MON_CSV"
       case "$line" in *[Rr]eset*) [ -e "$RUN/card-reset" ] || { : > "$RUN/card-reset"; echo "$(date '+%F %T')    MONITOR: card reports it needs a reset — stopping the test" >> "$CLOG"; }; kill_card_jobs ;; esac
       why=""
@@ -424,7 +458,7 @@ PY
 }
 t4_start() {
   local i
-  curl -s --max-time 2 "http://127.0.0.1:$T4_PORT/health" >/dev/null && { echo "port $T4_PORT is already in use by something else" >> "$1"; return 1; }
+  curl -s --max-time 2 "http://127.0.0.1:$T4_PORT/health" >/dev/null && { echo "port $T4_PORT is already in use by something else" >> "$1"; return 3; }
   # direct command (not pin()): $! must be llama-server itself, or t4_stop kills only a subshell
   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$UUID" LD_LIBRARY_PATH="${LLAMA_LIBRARY_PATH}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     "$LLAMA_SERVER" -m "$T4_MODEL" -ngl 99 -c "$T4_CTX" -fa on --cache-type-k q8_0 --cache-type-v q8_0 --parallel 1 \
@@ -454,7 +488,13 @@ t4_once() {  # t4_once LOGFILE → RES_HASH RES_PP RES_TG, or RES_REASON
   local out
   RES_HASH=""; RES_PP=""; RES_TG=""
   [ $T4_ON -eq 1 ] || return 0
-  t4_start "$1" || { t4_stop; RES_REASON="T4 llama-server did not start"; return 1; }
+  t4_start "$1"; local r=$?
+  if [ $r -ne 0 ]; then t4_stop
+    # rc 2 = a setup problem (port taken, model missing, slow load) — NOT a clock failure; rc 1 = CUDA trouble at load
+    [ $r -eq 3 ] && { RES_REASON="T4 port $T4_PORT is in use by something else"; return 2; }
+    grep -aqiE 'misaligned|illegal memory|CUDA error|out of memory' "$1" && { RES_REASON="T4 CUDA error while loading the model"; return 1; }
+    RES_REASON="T4 llama-server did not start (no CUDA error in its log)"; return 2
+  fi
   out=$(t4_query); t4_stop
   case "$out" in ERR*) RES_REASON="T4 $out"; return 1 ;; esac
   read -r RES_HASH RES_PP RES_TG <<< "$out"
@@ -485,9 +525,14 @@ battery_inner() {
   driver_alive || reboot_box "card unresponsive or needs a reset after T3 at $kind +$off"
   if [ $rc -ne 0 ] || echo "$out" | grep -aq FAULTY || ! echo "$out" | grep -aqE 'GPU 0: OK'; then RES_REASON="T3 gpu_burn (rc=$rc)"; return 1; fi
   log "  T3 gpu_burn ${GPUBURN_SECS}s  OK"
-  if ! t4_once "$RUN/t4-$tag.log"; then thermal_hit; driver_alive || reboot_box "card unresponsive or needs a reset after T4 at $kind +$off"; return 1; fi
+  t4_once "$RUN/t4-$tag.log"; local t4rc=$?
+  if [ $t4rc -eq 2 ] && ! thermal_hit; then
+    log "  T4 setup problem ($RES_REASON) — retrying once in 20 s"; sleep 20; t4_once "$RUN/t4-$tag.log"; t4rc=$?
+    [ $t4rc -eq 2 ] && { sset testing ""; die "the LLM check (T4) could not start twice: $RES_REASON (log: $RUN/t4-$tag.log). A setup problem, not a clock failure — fix it and start again; this step will be re-tested"; }
+  fi
+  if [ $t4rc -ne 0 ]; then thermal_hit; driver_alive || reboot_box "card unresponsive or needs a reset after T4 at $kind +$off"; return 1; fi
   [ $T4_ON -eq 1 ] && log "  T4 llama  hash $RES_HASH  prefill $RES_PP t/s  gen $RES_TG t/s"
-  [ "$(xid_count)" -gt "$x0" ] && { RES_REASON="new kernel Xid: $(sudo -n journalctl -k -b --no-pager | grep -E '\bXid\b' | tail -1 | cut -c1-120)"; return 1; }
+  [ "$(xid_count)" -gt "$x0" ] && { RES_REASON="new kernel Xid: $(sudo -n journalctl -k -b --no-pager | grep -E "\\bXid \\(PCI:${BDF%.*}\\)" | tail -1 | cut -c1-120)"; return 1; }
   return 0
 }
 battery() {  # battery mem|core OFFSET → RES_REASON (empty = clean), RES_THERMAL, RES_BW, RES_HASH, RES_PP, RES_TG, STAT_*
@@ -538,7 +583,9 @@ cleanup() {
   # a deliberate stop (./ocsweep --stop, or Ctrl-C in a foreground run) is not a crash: the step was simply not tested.
   # A reboot ordered by the sweep itself also arrives as SIGTERM — that one must keep counting as a failure.
   if [ $EXEC -eq 1 ] && { [ -e "$DATA/stop-requested" ] || { [ "$rc" = 130 ] && [ $AUTO -eq 0 ]; }; }; then
-    t=$(state get "$UUID" testing 2>/dev/null); [ -n "$t" ] && { state set "$UUID" testing ""; log "stopped by the user during $t — recorded as NOT tested"; }
+    t=$(state get "$UUID" testing 2>/dev/null)
+    if [ -n "$t" ]; then state set "$UUID" testing ""; log "stopped by the user during $t — recorded as NOT tested"
+      case "$t" in soak:*) n_=$(state get "$UUID" soak_tries); [ "${n_:-0}" -gt 0 ] && state set "$UUID" soak_tries $((n_ - 1)) ;; esac; fi
   fi
   [ -n "$WD_PID" ] && kill "$WD_PID" 2>/dev/null
   [ -n "$MON_PID" ] && kill "$MON_PID" 2>/dev/null
@@ -550,9 +597,12 @@ cleanup() {
       else log "driver unresponsive — cannot reset; a reboot restores stock"; fi
     fi
   fi
-  if [ $EXEC -eq 1 ]; then
+  if [ $EXEC -eq 1 ] && [ $FLAG_MINE -eq 1 ]; then
     sudo -n rm -f "/run/ocsweep/sweeping-$UUID"
-    [ -x "$LIBEXEC/ocsweep-apply" ] && sudo -n systemctl start --no-block ocsweep-apply.service 2>/dev/null   # put chosen offsets back
+    # put chosen offsets back — but not while the runner still has cards queued (it does that when the queue ends)
+    if [ $AUTO -eq 0 ] || [ "$(grep -c . "$QUEUE" 2>/dev/null || echo 0)" -le 1 ]; then
+      [ -x "$LIBEXEC/ocsweep-apply" ] && sudo -n systemctl start --no-block ocsweep-apply.service 2>/dev/null
+    fi
   fi
   log "logs: $CLOG  +  $RUN/"; exit "$rc"
 }
@@ -561,6 +611,10 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # ── pre-flight ──
+if [ $EXEC -eq 1 ]; then
+  exec 8>"$DATA/lock-${UUID:4:8}"; flock -n 8 || { echo "another ocsweep run is already testing this card — not starting a second one"; exit 1; }
+  rm -f "$DATA/stop-requested"      # only a --stop issued DURING this run counts
+fi
 log "═══ ocsweep  $NAME  $UUID  sm$CC  $BDF  ${VRAM_MB} MiB  mode=$([ $EXEC -eq 1 ] && echo "EXECUTE$([ $AUTO -eq 1 ] && echo ' +auto-reboot')" || echo DRY-RUN)  phases=$PHASES"
 sudo -n true 2>/dev/null || die "passwordless sudo needed (NVML clock offsets, /dev/mem, reboot)"
 sudo -n journalctl -k -b -n 1 --no-pager >/dev/null 2>&1 || die "cannot read the kernel log (sudo journalctl -k) — Xid errors would go unseen"
@@ -605,7 +659,8 @@ phase=$(sget phase)
 mp=$(sget mem_pass); mp=${mp:-0}
 if { [ "$phase" = done ] || [ "$phase" = core ]; } && [ -z "$(sget mem_fail)" ] && [ -z "$(sget mem_thermal)" ] && [ "$mp" -lt "$MEM_CEIL" ]; then
   log "memory reached +$mp last time without failing and the ceiling is now +$MEM_CEIL — continuing memory from +$mp"
-  [ $EXEC -eq 1 ] && { sset phase mem; sset mem_extended "$(date +%F) from +$mp to ceiling +$MEM_CEIL"; }
+  if [ $EXEC -eq 1 ]; then sset phase mem; sset mem_extended "$(date +%F) from +$mp to ceiling +$MEM_CEIL"
+    for k in soak_mem soak_core soak_tries soak_iso soak_result soak_gain; do sset "$k" ""; done; fi   # new numbers → fresh soak
   phase=mem
 fi
 if [ "$phase" = done ] && [ -z "$(sget soak_result)" ] && [[ ",$PHASES," == *,soak,* ]]; then
@@ -614,7 +669,9 @@ fi
 case "$phase" in done) log "sweep already finished for this card — --reset-state to redo it"; exit 0 ;;
                  error) die "card is marked error (failed at stock) — --reset-state after fixing" ;; esac
 
-[ $EXEC -eq 1 ] && { sudo -n mkdir -p /run/ocsweep; sudo -n touch "/run/ocsweep/sweeping-$UUID"; }   # ocsweep-apply stands aside
+if [ $EXEC -eq 1 ]; then     # ocsweep-apply stands aside for this card (flag set under its lock: no half-applied race)
+  sudo -n mkdir -p /run/ocsweep; sudo -n flock /run/ocsweep/apply.lock touch "/run/ocsweep/sweeping-$UUID" && FLAG_MINE=1
+fi
 wd_start; vt_start
 if [ $EXEC -eq 1 ]; then set_off core 0; set_off mem 0; sleep "$SETTLE"; fi
 
@@ -623,12 +680,12 @@ if [ -z "$phase" ]; then
   log "── reference at stock (mem +0, core +0)"
   if [ $EXEC -eq 1 ]; then
     sset name "$NAME"; sset started "$TS"; sset testing ref
-    for try in 1 2; do battery mem 0 && break; [ $RES_THERMAL -eq 1 ] && [ $try -eq 1 ] && { cool_down; continue; }; die "card FAILS at STOCK ($RES_REASON) — bad card, bad cooling or bad setup; not an overclock problem"; done
-    [ -n "$RES_REASON" ] && die "card FAILS at STOCK ($RES_REASON)"
+    for try in 1 2; do battery mem 0 && break; [ $RES_THERMAL -eq 1 ] && [ $try -eq 1 ] && { cool_down; continue; }; sset testing ""; die "card FAILS at STOCK ($RES_REASON) — bad card, bad cooling or bad setup; not an overclock problem"; done
+    [ -n "$RES_REASON" ] && { sset testing ""; die "card FAILS at STOCK ($RES_REASON)"; }
     record_step mem 0 PASS "stock reference"
     ref=$RES_HASH; sset bw_0 "$RES_BW"; sset mclk_0 "$(q clocks.max.memory)"
     if [ $T4_ON -eq 1 ]; then
-      t4_once "$RUN/t4-ref2.log"
+      t4_once "$RUN/t4-ref2.log" || { sset testing ""; die "second stock T4 run failed ($RES_REASON) — fix the LLM check setup, then start again"; }
       if [ "$RES_HASH" = "$ref" ]; then sset det 1; log "T4 deterministic (hash $ref) — any output change counts as corruption"
       else sset det 0; log "T4 NOT deterministic ($ref vs ${RES_HASH:-none}) — only checked for clean completion"; fi
     else sset det 0; fi
@@ -689,7 +746,7 @@ if [ "$phase" = mem ] && [[ ",$PHASES," == *,mem,* ]]; then
       sset mem_fail "$n"; sset mem_fail_reason "$RES_REASON"; sset testing ""; record_step mem "$n" FAIL "$RES_REASON"; log "FAILED memory +$n: $RES_REASON"
       set_off mem 0; sleep "$SETTLE"      # a ResetRequired shows up here → reboot, resume carries on
     else
-      sset "bw_$n" "$RES_BW"; sset mem_pass "$n"; sset testing ""; record_step mem "$n" PASS ""; log "PASSED memory +$n"
+      sset "bw_$n" "$RES_BW"; sset testing ""; sset mem_pass "$n"; record_step mem "$n" PASS ""; log "PASSED memory +$n"
     fi
   done
   if [ $EXEC -eq 1 ]; then
@@ -716,7 +773,7 @@ if [ "$phase" = core ] && [[ ",$PHASES," == *,core,* ]]; then
     elif [ $rc -ne 0 ]; then
       sset core_fail "$n"; sset core_fail_reason "$RES_REASON"; sset testing ""; record_step core "$n" FAIL "$RES_REASON"; log "FAILED core +$n: $RES_REASON"
       set_off core 0; sleep "$SETTLE"
-    else sset core_pass "$n"; sset testing ""; record_step core "$n" PASS ""; log "PASSED core +$n"; fi
+    else sset testing ""; sset core_pass "$n"; record_step core "$n" PASS ""; log "PASSED core +$n"; fi
   done
   if [ $EXEC -eq 1 ]; then
     p=$(sget core_pass); p=${p:-0}; [ "$p" -gt "$CORE_MAX" ] && p=$CORE_MAX; fin=$(( (p - CORE_MARGIN) / CORE_ROUND * CORE_ROUND )); [ "$fin" -lt 0 ] && fin=0
