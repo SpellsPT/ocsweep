@@ -85,8 +85,8 @@ time with `./ocsweep --stop`.
 ```
 
 **On a box whose cards are always busy** (an LLM server starts seconds after boot), edit `/etc/ocsweep/apply.conf`
-(created by the first `--apply`): set `APPLY_WHEN_BUSY=1` and `APPLY_BOOT_BEFORE="<your-llm>.service"`, then run
-`--apply` once more so the boot unit picks up the ordering. Without that, lost offsets on busy cards are reported
+(created by the first `--apply`): set `APPLY_WHEN_BUSY=1` (usually enough on its own). `APPLY_BOOT_BEFORE="<your-llm>.service"` is optional and
+only works for SYSTEM units, not `systemctl --user` services; run `--apply` once more after setting it. Without that, lost offsets on busy cards are reported
 as a FAILED check (never silently skipped) but not re-written. Add `ALERT_CMD` if you want a message on failures
 or a crash hold. If an older tool already keeps offsets applied, `--apply` the SAME values first, then disable the
 old tool, so two appliers never fight.

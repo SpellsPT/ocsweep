@@ -115,7 +115,7 @@ boot_unit() {  # boot_unit "UNITS-TO-RUN-BEFORE" → the ocsweep-apply-boot.serv
   printf '%s\n' "[Unit]" "Description=ocsweep: apply GPU overclocks at boot (skipped after an unclean shutdown)" \
     "After=nvidia-persistenced.service"
   [ -n "$1" ] && printf 'Before=%s\n' "$1"
-  printf '%s\n' "[Service]" "Type=oneshot" "RemainAfterExit=yes" "ExecStart=$LIBEXEC/ocsweep-apply --boot" \
+  printf '%s\n' "[Service]" "Type=oneshot" "RemainAfterExit=yes" "TimeoutStartSec=120" "ExecStart=$LIBEXEC/ocsweep-apply --boot" \
     "ExecStop=$LIBEXEC/ocsweep-apply --clean-shutdown" "[Install]" "WantedBy=multi-user.target"
 }
 install_apply_units() {

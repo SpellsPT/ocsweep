@@ -7,7 +7,9 @@
 #APPLY_WHEN_BUSY=1
 
 # Order the boot apply BEFORE these units, so offsets are set before the jobs start (space-separated unit names).
-# Takes effect on the next `ocsweep --apply`.
+# Only SYSTEM units: a system unit cannot order systemd USER units (systemctl --user ...) — for those, use
+# APPLY_WHEN_BUSY=1 instead. Note this puts the boot apply (which waits up to 60 s for the driver, max 120 s) on
+# those units' boot path. Takes effect on the next `ocsweep --apply`.
 #APPLY_BOOT_BEFORE="my-llm.service my-stt.service"
 
 # A GPU that is present but not in /etc/ocsweep/apply.json fails the check (a card swap cannot go unnoticed).
